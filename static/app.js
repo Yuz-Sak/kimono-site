@@ -6,15 +6,15 @@
   const DATA_KEYS = ['masters', 'purchases', 'items', 'sets', 'sales', 'expenses', 'photos', 'supply_purchases', 'settings'];
   const STORE_NAMES = [...DATA_KEYS, 'photo_files'];
   const STORE_OPTIONS = {
-    masters: { keyPath: 'id', autoIncrement: true },
-    purchases: { keyPath: 'id', autoIncrement: true },
-    items: { keyPath: 'id', autoIncrement: true },
-    sets: { keyPath: 'id', autoIncrement: true },
-    sales: { keyPath: 'id', autoIncrement: true },
-    expenses: { keyPath: 'id', autoIncrement: true },
+    masters: { keyPath: 'id' },
+    purchases: { keyPath: 'id' },
+    items: { keyPath: 'id' },
+    sets: { keyPath: 'id' },
+    sales: { keyPath: 'id' },
+    expenses: { keyPath: 'id' },
     photos: { keyPath: 'id' },
     photo_files: {},
-    supply_purchases: { keyPath: 'id', autoIncrement: true },
+    supply_purchases: { keyPath: 'id' },
     settings: { keyPath: 'key' },
   };
   const SUPPLY_KINDS = [
@@ -35,6 +35,15 @@
   const DB_VERSION = 3;
   const BACKUP_VERSION = 3;
   const MAX_PHOTO_SIZE = 1600;
+  // Stores whose record ids are UUIDs, the reference fields that point at them, and the stores rewritten on id migration.
+  const ID_STORES = ['masters', 'purchases', 'items', 'sets', 'sales', 'expenses', 'supply_purchases'];
+  const REKEY_STORES = [...ID_STORES, 'photos'];
+  const ID_REFS = {
+    items: { purchase_id: 'purchases', set_id: 'sets' },
+    sets: { cover_item_id: 'items' },
+    sales: { set_id: 'sets' },
+    photos: { item_id: 'items', set_id: 'sets' },
+  };
 
   const main = document.getElementById('app');
   const objectUrls = [];
@@ -43,6 +52,16 @@
   let toastTimer = null;
 
   class FormError extends Error {}
+
+  // Record ids are UUID strings. seq is the creation order used for sorting in place of the old numeric ids.
+  const newId = () => (crypto.randomUUID
+    ? crypto.randomUUID()
+    : Date.now().toString(36) + Math.random().toString(36).slice(2, 10));
+  let lastSeq = 0;
+  const nextSeq = () => {
+    lastSeq = Math.max(Date.now(), lastSeq + 1);
+    return lastSeq;
+  };
 
   /* ---------- IndexedDB ---------- */
 
@@ -61,7 +80,7 @@
           if (!sales.indexNames.contains('set_id')) sales.createIndex('set_id', 'set_id', { unique: true });
           if (event.oldVersion === 0) {
             const masters = tx.objectStore('masters');
-            SEEDS.forEach((seed) => masters.add(seed));
+            SEEDS.forEach((seed, i) => masters.add({ ...seed, id: newId(), seq: i + 1 }));
           } else if (event.oldVersion < 3) {
             retireRibbonCategory(tx);
           }
@@ -193,15 +212,15 @@
   const rateOf = (profit, income) => (income > 0 ? profit / income : null);
   const newestFirst = (key) => (a, b) => {
     if (a[key] !== b[key]) return a[key] < b[key] ? 1 : -1;
-    return b.id - a.id;
+    return b.seq - a.seq;
   };
-  const byDateThenId = (key) => (a, b) => {
+  const byDateThenSeq = (key) => (a, b) => {
     if (a[key] !== b[key]) return a[key] < b[key] ? -1 : 1;
-    return a.id - b.id;
+    return a.seq - b.seq;
   };
   const masterList = (st, kind) => st.masters
     .filter((m) => m.kind === kind)
-    .sort((a, b) => a.id - b.id);
+    .sort((a, b) => a.seq - b.seq);
   const namesOf = (st, kind) => masterList(st, kind).map((m) => m.name);
   const allowed = (names, ...extra) => [...names, ...extra.filter((v) => v && !names.includes(v))];
   // Sort comparator that puts the cover item first; other items keep their order.
@@ -262,7 +281,7 @@
         gallery,
         thumb: gallery[0]?.id ?? null,
       };
-    }).sort((a, b) => b.id - a.id);
+    }).sort((a, b) => b.seq - a.seq);
 
     const unsoldSets = setRows.filter((s) => !s.sold);
     const unassignedItems = itemRows.filter((i) => i.set_id == null);
@@ -417,20 +436,20 @@
     if (head === 'items') {
       if (arg === undefined) return { view: viewItems };
       if (arg === 'new') return { view: viewPurchaseForm };
-      return { view: viewItemForm, id: Number(arg) };
+      return { view: viewItemForm, id: arg };
     }
     if (head === 'stock') return { view: viewStock };
     if (head === 'supplies') return { view: viewSupplies };
     if (head === 'sets') {
       if (arg === undefined) return { view: viewSets };
       if (arg === 'new') return { view: viewSetForm, id: null };
-      if (sub === 'edit') return { view: viewSetForm, id: Number(arg) };
-      return { view: viewSetDetail, id: Number(arg) };
+      if (sub === 'edit') return { view: viewSetForm, id: arg };
+      return { view: viewSetDetail, id: arg };
     }
     if (head === 'expenses') {
       if (arg === undefined) return { view: viewExpenses };
       if (arg === 'new') return { view: viewExpenseForm, id: null };
-      return { view: viewExpenseForm, id: Number(arg) };
+      return { view: viewExpenseForm, id: arg };
     }
     if (head === 'report') return { view: viewReport };
     if (head === 'settings') return { view: viewSettings };
@@ -517,7 +536,7 @@
     const perSet = soldThisMonth.length ? Math.round(monthProfit / soldThisMonth.length) : 0;
     const soldSets = d.setRows
       .filter((s) => s.sold)
-      .sort((a, b) => b.sale.sold_on.localeCompare(a.sale.sold_on) || b.sale.id - a.sale.id)
+      .sort((a, b) => b.sale.sold_on.localeCompare(a.sale.sold_on) || b.sale.seq - a.sale.seq)
       .slice(0, 5);
     const createdSets = d.setRows.slice(0, 5);
     const recentItems = d.itemRows.slice(0, 5);
@@ -658,7 +677,7 @@
         <p class="muted">${rows.length}件 ／ 原価合計 ${yen(total)}</p>
         <div class="card table-wrap">
           <table>
-            <tr><th>写真</th><th>品番</th><th>分類</th><th>仕入れ先</th><th>仕入れ日</th><th class="num">原価</th><th>セット</th></tr>
+            <tr><th>写真</th><th>品番</th><th>分類</th><th>仕入れ先</th><th>仕入れ日</th><th class="num">原価</th><th>セット</th><th>受取</th></tr>
             ${rows.map((r) => `
               <tr>
                 <td>${urls.has(r.thumb) ? `<img class="thumb" src="${urls.get(r.thumb)}" alt="">` : ''}</td>
@@ -668,7 +687,8 @@
                 <td>${esc(r.purchased_on)}</td>
                 <td class="num">${yen(r.cost)}</td>
                 <td>${r.set_id != null ? `<a href="#/sets/${r.set_id}">${esc(r.set_name)}</a>` : '<span class="muted">未所属</span>'}</td>
-              </tr>`).join('') || '<tr><td colspan="7" class="muted">該当する仕入れ品はありません</td></tr>'}
+                <td><input type="checkbox" data-received-id="${r.id}" aria-label="受取済み"${r.received ? ' checked' : ''}></td>
+              </tr>`).join('') || '<tr><td colspan="8" class="muted">該当する仕入れ品はありません</td></tr>'}
           </table>
         </div>`,
     };
@@ -1430,12 +1450,15 @@
       throw new FormError('送料の内訳合計が送料合計と一致しません。送料を確認してください');
     }
 
-    const { id: purchaseId } = await dbTx(['purchases'], 'readwrite', (s) => ({
-      id: s.purchases.add({ purchased_on: purchasedOn, supplier, shipping_total: shippingTotal, memo }),
-    }));
+    const purchaseId = newId();
+    await dbTx(['purchases'], 'readwrite', (s) => {
+      s.purchases.add({ id: purchaseId, seq: nextSeq(), purchased_on: purchasedOn, supplier, shipping_total: shippingTotal, memo });
+    });
     await dbTx(['items'], 'readwrite', (s) => {
       rows.forEach((r) => {
         s.items.add({
+          id: newId(),
+          seq: nextSeq(),
           purchase_id: purchaseId,
           code: r.code,
           category: r.category,
@@ -1445,6 +1468,7 @@
           shipping: r.shipping,
           memo: r.memo,
           set_id: null,
+          received: false,
         });
       });
     });
@@ -1453,7 +1477,7 @@
   }
 
   async function saveItem(form) {
-    const id = Number(form.dataset.id);
+    const id = form.dataset.id;
     const st = await loadState();
     const existing = st.items.find((i) => i.id === id);
     if (!existing) throw new FormError('仕入れ品が見つかりません');
@@ -1489,8 +1513,8 @@
   // Click order of 構成品 in the picker. The first item becomes the cover photo.
   function updateItemOrder(form, el) {
     const field = form.elements.item_order;
-    const order = field.value ? field.value.split(',').map(Number) : [];
-    const id = Number(el.value);
+    const order = field.value ? field.value.split(',') : [];
+    const id = el.value;
     const next = el.checked
       ? (order.includes(id) ? order : [...order, id])
       : order.filter((x) => x !== id);
@@ -1516,20 +1540,23 @@
   }
 
   async function saveSet(form) {
-    const id = Number(form.dataset.id) || null;
+    const id = form.dataset.id || null;
     const name = fieldText(form, 'name');
     if (!name) throw new FormError('セット名を入力してください');
     const selected = new Set(
-      Array.from(form.querySelectorAll('input[name="item_ids"]:checked'), (el) => Number(el.value)),
+      Array.from(form.querySelectorAll('input[name="item_ids"]:checked'), (el) => el.value),
     );
     const st = await loadState();
     const d = derive(st);
     const existing = id == null ? null : st.sets.find((s) => s.id === id);
     if (id != null && !existing) throw new FormError('セットが見つかりません');
     if (existing && st.sales.some((s) => s.set_id === id)) throw new FormError('販売済みのセットは編集できません');
-    const order = fieldText(form, 'item_order').split(',').map(Number).filter((x) => selected.has(x));
+    const order = fieldText(form, 'item_order').split(',').filter((x) => selected.has(x));
     const coverId = [...order, ...selected].find((x) => selected.has(x)) ?? null;
+    const setId = existing?.id ?? newId();
     const data = {
+      id: setId,
+      seq: existing?.seq ?? nextSeq(),
       status: '出品前',
       list_price: 0,
       list_channel: '',
@@ -1540,9 +1567,7 @@
       cover_item_id: coverId,
       supplies: supplySelection(form, st, d, existing),
     };
-    const { id: setId } = await dbTx(['sets'], 'readwrite', (s) => ({
-      id: existing ? s.sets.put(data) : s.sets.add(data),
-    }));
+    await dbTx(['sets'], 'readwrite', (s) => { s.sets.put(data); });
     await assignItems(setId, selected);
     await addPhotos(form.elements.photos.files, { item_id: null, set_id: setId });
     notify(existing ? '保存しました' : '販売セットを作成しました');
@@ -1550,7 +1575,7 @@
   }
 
   async function saveListing(form) {
-    const setId = Number(form.dataset.id);
+    const setId = form.dataset.id;
     const st = await loadState();
     const set = st.sets.find((s) => s.id === setId);
     if (!set) throw new FormError('セットが見つかりません');
@@ -1581,7 +1606,7 @@
   }
 
   async function saveSale(form) {
-    const setId = Number(form.dataset.id);
+    const setId = form.dataset.id;
     const st = await loadState();
     const set = st.sets.find((s) => s.id === setId);
     if (!set) throw new FormError('セットが見つかりません');
@@ -1596,10 +1621,8 @@
       shipped: form.elements.shipped?.checked === true,
       memo: fieldText(form, 'memo'),
     };
-    await dbTx(['sales'], 'readwrite', (s) => {
-      if (existing) s.sales.put({ ...values, id: existing.id, set_id: setId });
-      else s.sales.add({ ...values, set_id: setId });
-    });
+    const data = { id: existing?.id ?? newId(), seq: existing?.seq ?? nextSeq(), ...values, set_id: setId };
+    await dbTx(['sales'], 'readwrite', (s) => { s.sales.put(data); });
     notify(existing ? '売却内容を更新しました' : '売却済みにしました');
     render();
   }
@@ -1613,17 +1636,28 @@
     render();
   }
 
+  async function setReceived(itemId, received) {
+    const st = await loadState();
+    const item = st.items.find((i) => i.id === itemId);
+    if (!item) return render();
+    await dbTx(['items'], 'readwrite', (s) => { s.items.put({ ...item, received }); });
+    notify(received ? '受取済みにしました' : '受取済みを取り消しました');
+    render();
+  }
+
   async function saveExpense(form) {
-    const id = Number(form.dataset.id) || null;
+    const id = form.dataset.id || null;
+    const st = await loadState();
+    const existing = id == null ? null : st.expenses.find((e) => e.id === id);
     const data = {
+      id: id ?? newId(),
+      seq: existing?.seq ?? nextSeq(),
       spent_on: fieldDate(form, 'spent_on'),
       category: fieldChoice(form, 'category', EXPENSE_CATEGORIES),
       amount: fieldInt(form, 'amount'),
       memo: fieldText(form, 'memo'),
     };
-    await dbTx(['expenses'], 'readwrite', (s) => (
-      id ? { id: s.expenses.put({ ...data, id }) } : { id: s.expenses.add(data) }
-    ));
+    await dbTx(['expenses'], 'readwrite', (s) => { s.expenses.put(data); });
     notify(id ? '保存しました' : '経費を登録しました');
     go('#/expenses');
   }
@@ -1646,7 +1680,7 @@
   }
 
   async function saveMaster(form) {
-    const id = Number(form.dataset.id);
+    const id = form.dataset.id;
     const st = await loadState();
     const current = st.masters.find((m) => m.id === id);
     if (!current) throw new FormError('項目が見つかりません');
@@ -1663,6 +1697,8 @@
   async function addMaster(form) {
     const kind = form.dataset.kind;
     const data = {
+      id: newId(),
+      seq: nextSeq(),
       kind,
       name: await uniqueMasterName(form, kind, null),
       fee_rate: feeFrom(form, kind),
@@ -1735,6 +1771,8 @@
     const count = fieldInt(form, 'count');
     if (count <= 0) throw new FormError('数は1以上で入力してください');
     const data = {
+      id: newId(),
+      seq: nextSeq(),
       kind,
       purchased_on: fieldDate(form, 'purchased_on'),
       count,
@@ -1791,7 +1829,7 @@
   const CSV_BUILDERS = {
     items: (st, d) => [
       ['ID', '品番', '分類', '仕入れ先', '仕入れ日', '本体価格', '送料', '原価', 'セット', 'メモ'],
-      [...d.itemRows].sort(byDateThenId('purchased_on')).map((i) => [
+      [...d.itemRows].sort(byDateThenSeq('purchased_on')).map((i) => [
         i.id, i.code, i.category, i.supplier, i.purchased_on, i.price, i.shipping, i.cost, i.set_name, i.memo,
       ]),
     ],
@@ -1806,14 +1844,14 @@
     ],
     sales: (st, d) => [
       ['ID', '販売日', 'セット名', '販売先', '販売価格', '手数料', '発送料', '発送済み', 'メモ'],
-      [...st.sales].sort(byDateThenId('sold_on')).map((s) => [
+      [...st.sales].sort(byDateThenSeq('sold_on')).map((s) => [
         s.id, s.sold_on, d.setById.get(s.set_id)?.name, s.channel, s.sale_price,
         s.platform_fee, s.shipping_cost, s.shipped ? '済' : '未', s.memo,
       ]),
     ],
     expenses: (st) => [
       ['ID', '日付', '分類', '金額', 'メモ'],
-      [...st.expenses].sort(byDateThenId('spent_on')).map((e) => [e.id, e.spent_on, e.category, e.amount, e.memo]),
+      [...st.expenses].sort(byDateThenSeq('spent_on')).map((e) => [e.id, e.spent_on, e.category, e.amount, e.memo]),
     ],
     monthly: (st) => [
       ['年月', '売上', '手数料・発送料', '仕入れ', '経費', '収支', '利益率'],
@@ -1876,17 +1914,60 @@
       data.items = data.items.map((i) => (i.category === '帯紐' ? { ...i, category: 'その他' } : i));
     }
     if (!confirm('現在のデータはすべて置き換えられます。よろしいですか？')) return;
+    const rows = rekeyData(data);
     const blobs = await Promise.all(data.photo_files.map(async (f) => ({
       id: f.id,
       blob: await (await fetch(f.data)).blob(),
     })));
     await dbTx(STORE_NAMES, 'readwrite', (s) => {
       STORE_NAMES.forEach((name) => { s[name].clear(); });
-      DATA_KEYS.forEach((k) => { data[k].forEach((r) => { s[k].put(r); }); });
+      DATA_KEYS.forEach((k) => { rows[k].forEach((r) => { s[k].put(r); }); });
       blobs.forEach((b) => { s.photo_files.put(b.blob, b.id); });
     });
     notify('復元しました');
     go('#/');
+  }
+
+  /* ---------- ID migration ---------- */
+
+  // Converts numeric ids to UUIDs. Every reference is rewritten with the same mapping.
+  // The old numeric id is kept as seq so the existing order is preserved.
+  function rekeyData(data) {
+    const keyMaps = Object.fromEntries(ID_STORES.map((name) => [
+      name,
+      new Map(data[name].filter((r) => typeof r.id === 'number').map((r) => [r.id, newId()])),
+    ]));
+    const rekeyRecord = (name, r) => {
+      const out = { ...r };
+      if (typeof r.id === 'number') {
+        out.id = keyMaps[name].get(r.id);
+        out.seq = r.seq ?? r.id;
+      }
+      Object.entries(ID_REFS[name] || {}).forEach(([field, target]) => {
+        if (typeof r[field] === 'number') out[field] = keyMaps[target].get(r[field]) ?? null;
+      });
+      return out;
+    };
+    return {
+      ...data,
+      ...Object.fromEntries(REKEY_STORES.map((name) => [name, data[name].map((r) => rekeyRecord(name, r))])),
+    };
+  }
+
+  // Runs at startup. Does nothing unless numeric ids are found in the saved data.
+  async function migrateNumericIds() {
+    const st = await loadState();
+    if (!REKEY_STORES.some((name) => st[name].some((r) => typeof r.id === 'number'))) return;
+    if (!confirm('データを新しい形式（UUID）に変換します。変換前のバックアップ（JSON）を保存します。よろしいですか？')) return;
+    await downloadBackup();
+    const rows = rekeyData(st);
+    await dbTx(REKEY_STORES, 'readwrite', (s) => {
+      REKEY_STORES.forEach((name) => {
+        s[name].clear();
+        rows[name].forEach((r) => { s[name].put(r); });
+      });
+    });
+    notify('データを変換しました');
   }
 
   /* ---------- Dispatch ---------- */
@@ -1926,13 +2007,13 @@
 
   async function runAction(action, data) {
     switch (action) {
-      case 'delete-item': return deleteItem(Number(data.id));
-      case 'delete-set': return deleteSet(Number(data.id));
-      case 'unlist': return unlistSet(Number(data.id));
-      case 'cancel-sale': return cancelSale(Number(data.id));
-      case 'delete-expense': return deleteExpense(Number(data.id));
-      case 'delete-supply': return deleteSupply(Number(data.id));
-      case 'delete-master': return deleteMaster(Number(data.id));
+      case 'delete-item': return deleteItem(data.id);
+      case 'delete-set': return deleteSet(data.id);
+      case 'unlist': return unlistSet(data.id);
+      case 'cancel-sale': return cancelSale(data.id);
+      case 'delete-expense': return deleteExpense(data.id);
+      case 'delete-supply': return deleteSupply(data.id);
+      case 'delete-master': return deleteMaster(data.id);
       case 'delete-photo':
         await deletePhotos([data.id]);
         return render();
@@ -2008,7 +2089,11 @@
       return;
     }
     if (el.dataset?.shippedId) {
-      setShipped(Number(el.dataset.shippedId), el.checked);
+      setShipped(el.dataset.shippedId, el.checked);
+      return;
+    }
+    if (el.dataset?.receivedId) {
+      setReceived(el.dataset.receivedId, el.checked);
       return;
     }
     if (el.name === 'item_ids' && el.form?.dataset.form === 'set') updateItemOrder(el.form, el);
@@ -2035,5 +2120,10 @@
   });
 
   window.addEventListener('hashchange', render);
-  render();
+  migrateNumericIds()
+    .catch((err) => {
+      console.error(err);
+      alert('データの変換に失敗しました。データは変更されていません。');
+    })
+    .finally(render);
 })();
