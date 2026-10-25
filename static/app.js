@@ -16,6 +16,7 @@
     photo_files: {},
     supply_purchases: { keyPath: 'id' },
     settings: { keyPath: 'key' },
+    outbox: { keyPath: ['store', 'id'] },
   };
   const SUPPLY_KINDS = [
     { kind: 'obiage', name: '帯揚げ' },
@@ -32,8 +33,10 @@
     { kind: 'channel', name: '直接', fee_rate: 0 },
   ];
   const DB_NAME = 'kimono_site';
-  const DB_VERSION = 3;
+  const DB_VERSION = 4;
   const BACKUP_VERSION = 3;
+  // Pending sync changes: one entry per record, and the latest change replaces earlier ones.
+  const OUTBOX = 'outbox';
   const MAX_PHOTO_SIZE = 1600;
   // Stores whose record ids are UUIDs, the reference fields that point at them, and the stores rewritten on id migration.
   const ID_STORES = ['masters', 'purchases', 'items', 'sets', 'sales', 'expenses', 'supply_purchases'];
@@ -46,6 +49,7 @@
   };
 
   const main = document.getElementById('app');
+  const pendingEl = document.getElementById('pending');
   const objectUrls = [];
   let dbPromise = null;
   let renderSeq = 0;
@@ -108,11 +112,19 @@
     };
   }
 
+  // Writes to synced stores are queued in the outbox inside the same transaction.
   function dbTx(names, mode, build) {
     return openDb().then((db) => new Promise((resolve, reject) => {
-      const tx = db.transaction(names, mode);
+      const writing = mode === 'readwrite';
+      const txNames = writing ? [...new Set([...names, OUTBOX])] : names;
+      const tx = db.transaction(txNames, mode);
       const stores = {};
-      names.forEach((name) => { stores[name] = tx.objectStore(name); });
+      txNames.forEach((name) => { stores[name] = tx.objectStore(name); });
+      if (writing) {
+        names.filter((name) => DATA_KEYS.includes(name)).forEach((name) => {
+          stores[name] = trackedStore(stores[name], stores[OUTBOX]);
+        });
+      }
       const requests = (build && build(stores)) || {};
       tx.oncomplete = () => resolve(Object.fromEntries(
         Object.entries(requests).map(([key, req]) => [key, req.result]),
@@ -120,6 +132,25 @@
       tx.onerror = () => reject(tx.error);
       tx.onabort = () => reject(tx.error || new Error('transaction aborted'));
     }));
+  }
+
+  // clear() is deliberately not queued. Callers queue the removals they need.
+  function trackedStore(store, outbox) {
+    const queue = (id, deleted) => queueChange(outbox, store.name, id, deleted);
+    return {
+      put: (value) => { const req = store.put(value); queue(value[store.keyPath], false); return req; },
+      add: (value) => { const req = store.add(value); queue(value[store.keyPath], false); return req; },
+      delete: (id) => { const req = store.delete(id); queue(id, true); return req; },
+      clear: () => store.clear(),
+    };
+  }
+
+  function queueChange(outbox, store, id, deleted) {
+    outbox.put({ store, id, deleted });
+  }
+
+  function pendingCount() {
+    return dbTx([OUTBOX], 'readonly', (s) => ({ count: s.outbox.count() })).then((r) => r.count);
   }
 
   function loadState() {
@@ -1914,6 +1945,7 @@
       data.items = data.items.map((i) => (i.category === '帯紐' ? { ...i, category: 'その他' } : i));
     }
     if (!confirm('現在のデータはすべて置き換えられます。よろしいですか？')) return;
+    const before = await loadState();
     const rows = rekeyData(data);
     const blobs = await Promise.all(data.photo_files.map(async (f) => ({
       id: f.id,
@@ -1921,7 +1953,12 @@
     })));
     await dbTx(STORE_NAMES, 'readwrite', (s) => {
       STORE_NAMES.forEach((name) => { s[name].clear(); });
-      DATA_KEYS.forEach((k) => { rows[k].forEach((r) => { s[k].put(r); }); });
+      DATA_KEYS.forEach((k) => {
+        const key = STORE_OPTIONS[k].keyPath;
+        const kept = new Set(rows[k].map((r) => r[key]));
+        before[k].filter((r) => !kept.has(r[key])).forEach((r) => { queueChange(s.outbox, k, r[key], true); });
+        rows[k].forEach((r) => { s[k].put(r); });
+      });
       blobs.forEach((b) => { s.photo_files.put(b.blob, b.id); });
     });
     notify('復元しました');
@@ -2038,11 +2075,12 @@
     try {
       const { parts, query } = parseHash();
       const { view, id = null } = route(parts);
-      const st = await loadState();
+      const [st, pending] = await Promise.all([loadState(), pendingCount()]);
       const page = await view({ st, d: derive(st), id, query });
       if (seq !== renderSeq) return;
       document.title = `${page.title} | 着物販売管理`;
       main.innerHTML = page.html;
+      pendingEl.textContent = `未送信 ${pending}件`;
     } catch (err) {
       console.error(err);
       if (seq === renderSeq) {
