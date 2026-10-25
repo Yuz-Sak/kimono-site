@@ -2,13 +2,29 @@
   'use strict';
 
   const EXPENSE_CATEGORIES = ['梱包材', '撮影・小物', 'クリーニング・補修', '通信費', '消耗品', 'その他'];
-  const SET_STATUSES = ['出品前', '出品中', '販売済み'];
-  const DATA_KEYS = ['masters', 'purchases', 'items', 'sets', 'sales', 'expenses', 'photos'];
+  const SET_STATUSES = ['出品前', '出品中', '売却済み'];
+  const DATA_KEYS = ['masters', 'purchases', 'items', 'sets', 'sales', 'expenses', 'photos', 'supply_purchases', 'settings'];
   const STORE_NAMES = [...DATA_KEYS, 'photo_files'];
+  const STORE_OPTIONS = {
+    masters: { keyPath: 'id', autoIncrement: true },
+    purchases: { keyPath: 'id', autoIncrement: true },
+    items: { keyPath: 'id', autoIncrement: true },
+    sets: { keyPath: 'id', autoIncrement: true },
+    sales: { keyPath: 'id', autoIncrement: true },
+    expenses: { keyPath: 'id', autoIncrement: true },
+    photos: { keyPath: 'id' },
+    photo_files: {},
+    supply_purchases: { keyPath: 'id', autoIncrement: true },
+    settings: { keyPath: 'key' },
+  };
+  const SUPPLY_KINDS = [
+    { kind: 'obiage', name: '帯揚げ' },
+    { kind: 'obijime', name: '帯締め' },
+  ];
+  const DEFAULT_PACKAGING_COST = 150;
   const SEEDS = [
     { kind: 'category', name: 'きもの', fee_rate: 0 },
     { kind: 'category', name: '帯', fee_rate: 0 },
-    { kind: 'category', name: '帯紐', fee_rate: 0 },
     { kind: 'category', name: 'その他', fee_rate: 0 },
     { kind: 'supplier', name: 'ヤフオク', fee_rate: 0 },
     { kind: 'supplier', name: '直接', fee_rate: 0 },
@@ -16,8 +32,8 @@
     { kind: 'channel', name: '直接', fee_rate: 0 },
   ];
   const DB_NAME = 'kimono_site';
-  const DB_VERSION = 2;
-  const BACKUP_VERSION = 2;
+  const DB_VERSION = 3;
+  const BACKUP_VERSION = 3;
   const MAX_PHOTO_SIZE = 1600;
 
   const main = document.getElementById('app');
@@ -34,26 +50,43 @@
     if (!dbPromise) {
       dbPromise = new Promise((resolve, reject) => {
         const req = indexedDB.open(DB_NAME, DB_VERSION);
-        req.onupgradeneeded = () => {
+        req.onupgradeneeded = (event) => {
           const db = req.result;
-          Array.from(db.objectStoreNames).forEach((name) => db.deleteObjectStore(name));
-          db.createObjectStore('masters', { keyPath: 'id', autoIncrement: true });
-          db.createObjectStore('purchases', { keyPath: 'id', autoIncrement: true });
-          db.createObjectStore('items', { keyPath: 'id', autoIncrement: true });
-          db.createObjectStore('sets', { keyPath: 'id', autoIncrement: true });
-          db.createObjectStore('sales', { keyPath: 'id', autoIncrement: true })
-            .createIndex('set_id', 'set_id', { unique: true });
-          db.createObjectStore('expenses', { keyPath: 'id', autoIncrement: true });
-          db.createObjectStore('photos', { keyPath: 'id' });
-          db.createObjectStore('photo_files');
-          const masters = req.transaction.objectStore('masters');
-          SEEDS.forEach((seed) => masters.add(seed));
+          const tx = req.transaction;
+          // Upgrades keep existing records: only missing stores are created.
+          Object.entries(STORE_OPTIONS).forEach(([name, options]) => {
+            if (!db.objectStoreNames.contains(name)) db.createObjectStore(name, options);
+          });
+          const sales = tx.objectStore('sales');
+          if (!sales.indexNames.contains('set_id')) sales.createIndex('set_id', 'set_id', { unique: true });
+          if (event.oldVersion === 0) {
+            const masters = tx.objectStore('masters');
+            SEEDS.forEach((seed) => masters.add(seed));
+          } else if (event.oldVersion < 3) {
+            retireRibbonCategory(tx);
+          }
         };
         req.onsuccess = () => resolve(req.result);
         req.onerror = () => reject(req.error);
       });
     }
     return dbPromise;
+  }
+
+  // 帯紐 is retired: its master entry is removed and its items move to その他.
+  function retireRibbonCategory(tx) {
+    const masters = tx.objectStore('masters');
+    masters.getAll().onsuccess = (e) => {
+      e.target.result
+        .filter((m) => m.kind === 'category' && m.name === '帯紐')
+        .forEach((m) => masters.delete(m.id));
+    };
+    const items = tx.objectStore('items');
+    items.getAll().onsuccess = (e) => {
+      e.target.result
+        .filter((i) => i.category === '帯紐')
+        .forEach((i) => items.put({ ...i, category: 'その他' }));
+    };
   }
 
   function dbTx(names, mode, build) {
@@ -171,6 +204,9 @@
     .sort((a, b) => a.id - b.id);
   const namesOf = (st, kind) => masterList(st, kind).map((m) => m.name);
   const allowed = (names, ...extra) => [...names, ...extra.filter((v) => v && !names.includes(v))];
+  // Sort comparator that puts the cover item first; other items keep their order.
+  const coverFirst = (coverId) => (a, b) => (b.id === coverId) - (a.id === coverId);
+  const packagingCostOf = (st) => st.settings.find((x) => x.key === 'packaging_cost')?.value ?? DEFAULT_PACKAGING_COST;
 
   function groupBy(list, keyOf) {
     const map = new Map();
@@ -197,31 +233,50 @@
       thumb: itemPhotos.get(i.id)?.[0]?.id ?? null,
     })).sort(newestFirst('purchased_on'));
 
+    // Display order: photos added to the set (newest first), then member photos with the cover item first.
     const setRows = st.sets.map((s) => {
       const sale = saleBySet.get(s.id) || null;
       const members = membersBySet.get(s.id) || [];
-      const cost = sum(members.map(itemCost));
+      const supplies = s.supplies || [];
+      const cost = sum(members.map(itemCost)) + sum(supplies.map((x) => x.unit_cost * x.qty));
       const sold = sale !== null;
-      const revenue = sold ? sale.sale_price + sale.shipping_charged : 0;
+      const revenue = sold ? sale.sale_price : 0;
       const fees = sold ? sale.platform_fee + sale.shipping_cost : 0;
+      const gallery = [
+        ...[...(setPhotos.get(s.id) || [])].reverse(),
+        ...[...members].sort(coverFirst(s.cover_item_id)).flatMap((i) => itemPhotos.get(i.id) || []),
+      ];
       return {
         ...s,
         sale,
         sold,
         members,
+        supplies,
         cost,
         revenue,
         fees,
         profit: sold ? revenue - fees - cost : null,
         item_count: members.length,
         item_names: members.map((i) => i.code).join(' / '),
-        display_status: sold ? '販売済み' : s.status,
-        thumb: setPhotos.get(s.id)?.[0]?.id ?? null,
+        display_status: sold ? '売却済み' : s.status,
+        gallery,
+        thumb: gallery[0]?.id ?? null,
       };
     }).sort((a, b) => b.id - a.id);
 
     const unsoldSets = setRows.filter((s) => !s.sold);
     const unassignedItems = itemRows.filter((i) => i.set_id == null);
+
+    // 備品 stock = purchased count - count used by sets. Unit cost is the cumulative average.
+    const supplyStock = Object.fromEntries(SUPPLY_KINDS.map(({ kind, name }) => {
+      const bought = st.supply_purchases.filter((p) => p.kind === kind);
+      const count = sum(bought.map((p) => p.count));
+      const total = sum(bought.map((p) => p.total));
+      const used = sum(st.sets.flatMap((s) => s.supplies || []).filter((x) => x.kind === kind).map((x) => x.qty));
+      const unit = count ? Math.round(total / count) : 0;
+      const left = count - used;
+      return [kind, { kind, name, count, total, unit, left, value: left * unit }];
+    }));
 
     return {
       setById,
@@ -232,7 +287,10 @@
       itemRows,
       unsoldSets,
       unassignedItems,
-      stockCost: sum(unsoldSets.map((s) => s.cost)) + sum(unassignedItems.map((i) => i.cost)),
+      supplyStock,
+      stockCost: sum(unsoldSets.map((s) => s.cost))
+        + sum(unassignedItems.map((i) => i.cost))
+        + sum(Object.values(supplyStock).map((s) => s.value)),
       listedValue: sum(unsoldSets.filter((s) => s.status === '出品中').map((s) => s.list_price)),
     };
   }
@@ -240,9 +298,10 @@
   // Cash-basis ledger: sales by 販売日, purchases by 仕入れ日, expenses by 支出日.
   function ledger(st, match) {
     const sales = st.sales.filter((s) => match(s.sold_on));
-    const income = sum(sales.map((s) => s.sale_price + s.shipping_charged));
+    const income = sum(sales.map((s) => s.sale_price));
     const sales_cost = sum(sales.map((s) => s.platform_fee + s.shipping_cost));
-    const purchase = sum(st.items.filter((i) => match(i.purchased_on)).map(itemCost));
+    const purchase = sum(st.items.filter((i) => match(i.purchased_on)).map(itemCost))
+      + sum(st.supply_purchases.filter((p) => match(p.purchased_on)).map((p) => p.total));
     const expense = sum(st.expenses.filter((e) => match(e.spent_on)).map((e) => e.amount));
     const profit = income - sales_cost - purchase - expense;
     return {
@@ -267,12 +326,15 @@
     };
     st.sales.filter((s) => inYear(s.sold_on)).forEach((s) => {
       const m = month(s.sold_on.slice(0, 7));
-      m.income += s.sale_price + s.shipping_charged;
+      m.income += s.sale_price;
       m.sales_cost += s.platform_fee + s.shipping_cost;
       m.count += 1;
     });
     st.items.filter((i) => inYear(i.purchased_on)).forEach((i) => {
       month(i.purchased_on.slice(0, 7)).purchase += itemCost(i);
+    });
+    st.supply_purchases.filter((p) => inYear(p.purchased_on)).forEach((p) => {
+      month(p.purchased_on.slice(0, 7)).purchase += p.total;
     });
     st.expenses.filter((e) => inYear(e.spent_on)).forEach((e) => {
       month(e.spent_on.slice(0, 7)).expense += e.amount;
@@ -301,6 +363,7 @@
     const years = new Set([new Date().getFullYear()]);
     st.sales.forEach((s) => years.add(Number(s.sold_on.slice(0, 4))));
     st.items.forEach((i) => years.add(Number(i.purchased_on.slice(0, 4))));
+    st.supply_purchases.forEach((p) => years.add(Number(p.purchased_on.slice(0, 4))));
     st.expenses.forEach((e) => years.add(Number(e.spent_on.slice(0, 4))));
     return [...years].sort((a, b) => b - a);
   }
@@ -357,6 +420,7 @@
       return { view: viewItemForm, id: Number(arg) };
     }
     if (head === 'stock') return { view: viewStock };
+    if (head === 'supplies') return { view: viewSupplies };
     if (head === 'sets') {
       if (arg === undefined) return { view: viewSets };
       if (arg === 'new') return { view: viewSetForm, id: null };
@@ -448,8 +512,14 @@
     const now = new Date();
     const thisMonth = today().slice(0, 7);
     const month = ledger(st, (date) => date.startsWith(thisMonth));
-    const year = ledger(st, (date) => date.startsWith(`${now.getFullYear()}-`));
-    const recentSales = [...st.sales].sort(newestFirst('sold_on')).slice(0, 5);
+    const soldThisMonth = d.setRows.filter((s) => s.sold && s.sale.sold_on.startsWith(thisMonth));
+    const monthProfit = sum(soldThisMonth.map((s) => s.profit));
+    const perSet = soldThisMonth.length ? Math.round(monthProfit / soldThisMonth.length) : 0;
+    const soldSets = d.setRows
+      .filter((s) => s.sold)
+      .sort((a, b) => b.sale.sold_on.localeCompare(a.sale.sold_on) || b.sale.id - a.sale.id)
+      .slice(0, 5);
+    const createdSets = d.setRows.slice(0, 5);
     const recentItems = d.itemRows.slice(0, 5);
     return {
       title: 'ホーム',
@@ -459,7 +529,8 @@
           ${kpi('今月の売上', yen(month.income))}
           ${kpi('今月の支出', yen(month.purchase + month.expense + month.sales_cost))}
           ${kpi('今月の収支', yen(month.profit), signClass(month.profit))}
-          ${kpi('今年の収支', yen(year.profit), signClass(year.profit))}
+          ${kpi('今月の利益の総額', yen(monthProfit), signClass(monthProfit))}
+          ${kpi(`1つ当たりの平均利益（${soldThisMonth.length}件）`, yen(perSet), signClass(perSet))}
           ${kpi('在庫のセット', `${d.unsoldSets.length}件`)}
           ${kpi('在庫の原価', yen(d.stockCost))}
         </div>
@@ -468,16 +539,29 @@
           <a class="btn sub" href="#/sets/new">+ 販売セットを作る</a>
           <a class="btn sub" href="#/expenses/new">+ 経費を入力</a>
         </div>
-        <h2>最近の販売</h2>
+        <h2>最近の販売済みセット</h2>
         <div class="card table-wrap">
           <table>
-            <tr><th>販売日</th><th>セット</th><th class="num">販売価格＋送料</th></tr>
-            ${recentSales.map((s) => `
+            <tr><th>販売日</th><th>セット</th><th class="num">販売価格</th><th class="nowrap">発送済み</th></tr>
+            ${soldSets.map((s) => `
               <tr>
-                <td>${esc(s.sold_on)}</td>
-                <td><a href="#/sets/${s.set_id}">${esc(d.setById.get(s.set_id)?.name)}</a></td>
-                <td class="num">${yen(s.sale_price + s.shipping_charged)}</td>
-              </tr>`).join('') || '<tr><td colspan="3" class="muted">販売記録はまだありません</td></tr>'}
+                <td>${esc(s.sale.sold_on)}</td>
+                <td><a href="#/sets/${s.id}">${esc(s.name)}</a></td>
+                <td class="num">${yen(s.sale.sale_price)}</td>
+                <td><input type="checkbox" data-shipped-id="${s.sale.id}" aria-label="発送済み"${s.sale.shipped ? ' checked' : ''}></td>
+              </tr>`).join('') || '<tr><td colspan="4" class="muted">販売済みのセットはまだありません</td></tr>'}
+          </table>
+        </div>
+        <h2>最近作成したセット</h2>
+        <div class="card table-wrap">
+          <table>
+            <tr><th>セット名</th><th>状態</th><th class="num">原価</th></tr>
+            ${createdSets.map((s) => `
+              <tr>
+                <td><a href="#/sets/${s.id}">${esc(s.name)}</a></td>
+                <td><span class="badge ${badgeClass(s)}">${esc(s.display_status)}</span></td>
+                <td class="num">${yen(s.cost)}</td>
+              </tr>`).join('') || '<tr><td colspan="3" class="muted">販売セットはまだありません</td></tr>'}
           </table>
         </div>
         <h2>最近の仕入れ</h2>
@@ -749,15 +833,28 @@
       };
     }
     const photos = set ? d.setPhotos.get(set.id) || [] : [];
-    const urls = await photoUrls(photos.map((p) => p.id));
-    const available = st.items
-      .filter((i) => i.set_id == null || (set && i.set_id === set.id))
-      .sort(newestFirst('purchased_on'));
-    const checks = available.map((i) => `
-        <label>
-          <input type="checkbox" name="item_ids" value="${i.id}"${set && i.set_id === set.id ? ' checked' : ''}>
-          ${esc(i.code)}（${esc(i.category)}・${yen(itemCost(i))}）
+    const available = d.itemRows.filter((i) => i.set_id == null || (set && i.set_id === set.id));
+    const urls = await photoUrls([...photos.map((p) => p.id), ...available.map((i) => i.thumb)]);
+    const members = new Set(set ? set.members.map((i) => i.id) : []);
+    const orderIds = set ? [...set.members].sort(coverFirst(set.cover_item_id)).map((i) => i.id) : [];
+    const picks = available.map((i) => `
+        <label class="pick">
+          <input type="checkbox" name="item_ids" value="${i.id}"${members.has(i.id) ? ' checked' : ''}>
+          ${urls.has(i.thumb) ? `<img src="${urls.get(i.thumb)}" alt="">` : '<span class="pick-none">写真なし</span>'}
+          <b>${esc(i.code)}</b>
+          <span class="muted">${esc(i.category)}・${yen(i.cost)}</span>
         </label>`).join('') || '<p class="muted">選べる仕入れ品がありません。先に仕入れを登録してください。</p>';
+    const used = (kind) => set?.supplies.find((x) => x.kind === kind);
+    const supplyChecks = [
+      `<label class="check"><input type="checkbox" name="supply" value="packaging"${set ? (used('packaging') ? ' checked' : '') : ' checked'}> 梱包材（一律 ${yen(packagingCostOf(st))}）</label>`,
+      ...SUPPLY_KINDS.map(({ kind, name }) => {
+        const stock = d.supplyStock[kind];
+        const canUse = Boolean(used(kind)) || stock.left >= 1;
+        const checked = Boolean(used(kind)) || !set;
+        const disabled = set && !canUse;
+        return `<label class="check"><input type="checkbox" name="supply" value="${kind}"${checked ? ' checked' : ''}${disabled ? ' disabled' : ''}> ${name}（平均 ${yen(stock.unit)} × 1本・在庫 ${stock.left}本${canUse ? '' : ' ／ 在庫なし'}）</label>`;
+      }),
+    ].join('');
     const title = set ? '販売セットの編集' : '販売セットの作成';
     return {
       title,
@@ -771,10 +868,16 @@
             <textarea name="description">${esc(set?.description ?? '')}</textarea>
           </label>
           <div class="wide">
-            <h2>構成品（未所属の仕入れ品から選択）</h2>
-            <div class="card checks">${checks}</div>
+            <h2>構成品</h2>
+            <p class="muted">写真をタップして選びます。最初に選んだ品の写真がセットの表示写真になります。</p>
+            <div class="picks">${picks}</div>
           </div>
-          <label class="wide">写真を追加（複数選択可）
+          <input type="hidden" name="item_order" value="${orderIds.join(',')}">
+          <div class="wide">
+            <h2>備品</h2>
+            <div class="card checks">${supplyChecks}</div>
+          </div>
+          <label class="wide">写真を追加（複数選択可・追加した写真は一番前に表示されます）
             <input type="file" name="photos" accept="image/*" multiple>
           </label>
           <div class="wide actions">
@@ -782,20 +885,28 @@
             <a class="btn sub" href="${set ? `#/sets/${set.id}` : '#/sets'}">戻る</a>
           </div>
         </form>
-        ${set ? photoGrid(photos, urls, true) : ''}`,
+        ${set ? photoGrid([...photos].reverse(), urls, true) : ''}`,
     };
   }
 
   async function viewSetDetail({ st, d, id }) {
     const set = d.setRows.find((s) => s.id === id);
     if (!set) return notFound();
-    const photos = d.setPhotos.get(set.id) || [];
+    const photos = set.gallery;
     const urls = await photoUrls(photos.map((p) => p.id));
     const sale = set.sale;
     const listed = set.status === '出品中';
     const salePrice = sale ? sale.sale_price : set.list_price;
     const channel = sale?.channel ?? set.list_channel ?? '';
     const fee = sale ? sale.platform_fee : Math.round((salePrice * channelRate(st, channel)) / 100);
+
+    const suppliesHtml = set.supplies.map((x) => `
+      <tr>
+        <td>備品</td>
+        <td>${esc(x.name)}</td>
+        <td colspan="4" class="muted">${x.kind === 'packaging' ? `一律 ${yen(x.unit_cost)}` : `平均単価 ${yen(x.unit_cost)} × ${x.qty}本`}</td>
+        <td class="num">${yen(x.unit_cost * x.qty)}</td>
+      </tr>`).join('');
 
     const itemsHtml = set.members.map((i) => `
       <tr>
@@ -839,20 +950,20 @@
           <label>販売価格（円）
             <input type="number" name="sale_price" data-role="sale-price" min="0" inputmode="numeric" value="${salePrice}">
           </label>
-          <label>送料受取（円）
-            <input type="number" name="shipping_charged" min="0" inputmode="numeric" value="${sale ? sale.shipping_charged : 0}">
-          </label>
           <label>販売手数料（円）
             <input type="number" name="platform_fee" data-role="fee" data-manual="${sale ? '1' : '0'}" min="0" inputmode="numeric" value="${fee}">
           </label>
           <label>発送料・実費（円）
             <input type="number" name="shipping_cost" min="0" inputmode="numeric" value="${sale ? sale.shipping_cost : 0}">
           </label>
+          <label class="check wide">
+            <input type="checkbox" name="shipped"${sale?.shipped ? ' checked' : ''}> 発送済み
+          </label>
           <label class="wide">メモ
             <textarea name="memo">${esc(sale?.memo ?? '')}</textarea>
           </label>
           <div class="wide actions">
-            <button class="btn" type="submit">${set.sold ? '販売内容を更新' : '販売を記録する'}</button>
+            <button class="btn" type="submit">${set.sold ? '販売内容を更新' : '売却済みにする'}</button>
             ${set.sold ? `<button class="btn danger small" type="button" data-action="cancel-sale" data-id="${sale.id}" data-confirm="販売記録を取り消しますか？セットは出品中に戻ります。">販売記録を取り消す</button>` : ''}
           </div>
         </form>`
@@ -860,8 +971,8 @@
 
     const profitHtml = set.sold ? `
       <table>
-        <tr><td>販売価格＋送料受取</td><td class="num">${yen(set.revenue)}</td></tr>
-        <tr><td>原価（本体＋送料）</td><td class="num">${Number(set.cost) ? '-' : ''}${yen(set.cost)}</td></tr>
+        <tr><td>販売価格</td><td class="num">${yen(set.revenue)}</td></tr>
+        <tr><td>原価（本体＋送料＋備品）</td><td class="num">${Number(set.cost) ? '-' : ''}${yen(set.cost)}</td></tr>
         <tr><td>販売手数料・発送料</td><td class="num">${Number(set.fees) ? '-' : ''}${yen(set.fees)}</td></tr>
         <tr><th>利益</th><th class="num ${signClass(set.profit)}">${yen(set.profit)}</th></tr>
         <tr><td>利益率</td><td class="num">${pct(rateOf(set.profit, set.revenue))}</td></tr>
@@ -886,7 +997,7 @@
         <div class="card table-wrap">
           <table>
             <tr><th>分類</th><th>品番</th><th>仕入れ先</th><th>仕入れ日</th><th class="num">本体</th><th class="num">送料</th><th class="num">原価</th></tr>
-            ${itemsHtml}
+            ${itemsHtml}${suppliesHtml}
             <tr><th colspan="6">原価合計</th><th class="num">${yen(set.cost)}</th></tr>
           </table>
         </div>
@@ -897,6 +1008,74 @@
         <h2>利益</h2>
         <div class="card table-wrap">${profitHtml}</div>
         ${deleteHtml}`,
+    };
+  }
+
+  function viewSupplies({ st, d }) {
+    const stockRows = SUPPLY_KINDS.map(({ kind }) => {
+      const s = d.supplyStock[kind];
+      return `
+        <tr>
+          <td>${esc(s.name)}</td>
+          <td class="num">${s.count}本</td>
+          <td class="num">${s.count - s.left}本</td>
+          <td class="num">${s.left}本</td>
+          <td class="num">${yen(s.unit)}</td>
+          <td class="num">${yen(s.value)}</td>
+        </tr>`;
+    }).join('');
+    const history = [...st.supply_purchases].sort(newestFirst('purchased_on')).map((p) => {
+      const kindName = SUPPLY_KINDS.find((k) => k.kind === p.kind)?.name ?? p.kind;
+      return `
+        <tr>
+          <td>${esc(p.purchased_on)}</td>
+          <td>${esc(kindName)}</td>
+          <td class="num">${p.count}本</td>
+          <td class="num">${yen(p.total)}</td>
+          <td class="num">${yen(Math.round(p.total / p.count))}</td>
+          <td>${esc(p.memo)}</td>
+          <td><button class="btn danger small" type="button" data-action="delete-supply" data-id="${p.id}" data-confirm="この購入記録を削除しますか？">削除</button></td>
+        </tr>`;
+    }).join('') || '<tr><td colspan="7" class="muted">購入記録はまだありません</td></tr>';
+    return {
+      title: '備品',
+      html: `
+        <h1>備品</h1>
+        <p class="muted">帯締め・帯揚げは数と総額で登録し、平均単価でセットの原価に入れます。梱包材は設定の単価を、セットごとに原価に入れます。</p>
+        <div class="card table-wrap">
+          <table>
+            <tr><th>備品</th><th class="num">購入数</th><th class="num">使用数</th><th class="num">在庫数</th><th class="num">平均単価</th><th class="num">在庫の金額</th></tr>
+            ${stockRows}
+          </table>
+        </div>
+        <h2>購入を登録</h2>
+        <form class="card grid" data-form="supply">
+          <label>備品
+            <select name="kind">${SUPPLY_KINDS.map((k) => opt(k.kind, k.name, false)).join('')}</select>
+          </label>
+          <label>購入日
+            <input type="date" name="purchased_on" value="${today()}">
+          </label>
+          <label>数
+            <input type="number" name="count" required min="1" inputmode="numeric">
+          </label>
+          <label>総額（円）
+            <input type="number" name="total" required min="0" inputmode="numeric">
+          </label>
+          <label class="wide">メモ
+            <textarea name="memo"></textarea>
+          </label>
+          <div class="wide actions">
+            <button class="btn" type="submit">登録する</button>
+          </div>
+        </form>
+        <h2>購入の履歴</h2>
+        <div class="card table-wrap">
+          <table>
+            <tr><th>購入日</th><th>備品</th><th class="num">数</th><th class="num">総額</th><th class="num">平均単価</th><th>メモ</th><th></th></tr>
+            ${history}
+          </table>
+        </div>`,
     };
   }
 
@@ -967,6 +1146,76 @@
     };
   }
 
+  const PIE_COLORS = { '利益': '#2e7d4f', '仕入れ': '#8c2f39', '経費': '#c9a227', '手数料・発送料': '#7a6e66' };
+
+  // Monthly profit as bars around a zero line. rows are newest first.
+  function profitBars(rows) {
+    const list = [...rows].reverse();
+    if (!list.length) return '<p class="muted">データがありません</p>';
+    const W = 640;
+    const H = 240;
+    const pad = 24;
+    const top = 14;
+    const bottom = 34;
+    const max = Math.max(1, ...list.map((m) => Math.abs(m.profit)));
+    const half = (H - top - bottom) / 2;
+    const y0 = top + half;
+    const slot = (W - pad * 2) / list.length;
+    const barW = Math.max(4, Math.min(36, slot * 0.6));
+    const bars = list.map((m, k) => {
+      const x = pad + slot * k + (slot - barW) / 2;
+      const h = (Math.abs(m.profit) / max) * half;
+      const y = m.profit >= 0 ? y0 - h : y0;
+      return `
+        <rect class="bar ${m.profit >= 0 ? 'plus' : 'minus'}" x="${x.toFixed(1)}" y="${y.toFixed(1)}" width="${barW.toFixed(1)}" height="${h.toFixed(1)}"><title>${esc(m.ym)} 収支 ${yen(m.profit)}</title></rect>
+        <text class="axis" x="${(x + barW / 2).toFixed(1)}" y="${H - 12}" text-anchor="middle">${esc(m.ym.slice(2).replace('-', '/'))}</text>`;
+    }).join('');
+    return `
+      <div class="chart">
+        <svg viewBox="0 0 ${W} ${H}" role="img" aria-label="月別の収支">
+          <line class="axis" x1="${pad}" x2="${W - pad}" y1="${y0}" y2="${y0}"></line>
+          ${bars}
+        </svg>
+      </div>`;
+  }
+
+  // Breakdown of sales: profit, purchases, expenses, fees and shipping. Negative profit is shown as 0.
+  function incomePie(period) {
+    const parts = [
+      ['利益', Math.max(0, period.profit)],
+      ['仕入れ', period.purchase],
+      ['経費', period.expense],
+      ['手数料・発送料', period.sales_cost],
+    ].filter(([, v]) => v > 0);
+    const total = sum(parts.map(([, v]) => v));
+    if (!total) return '<p class="muted">この期間の売上・支出データがありません</p>';
+    const cx = 100;
+    const cy = 100;
+    const r = 90;
+    let angle = -Math.PI / 2;
+    const slices = parts.map(([label, v]) => {
+      const frac = v / total;
+      const color = PIE_COLORS[label];
+      if (frac >= 1) return `<circle cx="${cx}" cy="${cy}" r="${r}" fill="${color}"><title>${label} ${yen(v)}</title></circle>`;
+      const next = angle + frac * 2 * Math.PI;
+      const x1 = cx + r * Math.cos(angle);
+      const y1 = cy + r * Math.sin(angle);
+      const x2 = cx + r * Math.cos(next);
+      const y2 = cy + r * Math.sin(next);
+      const large = frac > 0.5 ? 1 : 0;
+      angle = next;
+      return `<path d="M${cx} ${cy} L${x1.toFixed(2)} ${y1.toFixed(2)} A${r} ${r} 0 ${large} 1 ${x2.toFixed(2)} ${y2.toFixed(2)} Z" fill="${color}"><title>${label} ${yen(v)}</title></path>`;
+    }).join('');
+    const legend = parts.map(([label, v]) => `
+        <li><span class="swatch" style="background:${PIE_COLORS[label]}"></span>${label}　${yen(v)}（${pct(v / total)}）</li>`).join('');
+    return `
+      <div class="pie">
+        <svg class="pie-svg" viewBox="0 0 200 200" role="img" aria-label="売上の内訳">${slices}</svg>
+        <ul class="legend">${legend}</ul>
+      </div>
+      ${period.profit < 0 ? '<p class="muted">赤字の期間は利益を0円として表示しています。</p>' : ''}`;
+  }
+
   function viewReport({ st, query }) {
     const currentYear = new Date().getFullYear();
     const yearRaw = query.get('year') ?? String(currentYear);
@@ -1032,6 +1281,17 @@
                 <th class="num">${pct(total.rate)}</th>
               </tr>` : ''}
           </table>
+        </div>
+        <h2>ダッシュボード</h2>
+        <div class="dash">
+          <div class="card">
+            <h3>月別の利益推移</h3>
+            ${profitBars(rows)}
+          </div>
+          <div class="card">
+            <h3>${label}の売上の内訳</h3>
+            ${incomePie(period)}
+          </div>
         </div>`,
     };
   }
@@ -1058,6 +1318,22 @@
       </div>`;
   }
 
+  function packagingSection(st) {
+    return `
+      <h2>備品</h2>
+      <div class="card">
+        <form class="grid" data-form="packaging">
+          <label>梱包材の単価（円・1セットごと）
+            <input type="number" name="packaging_cost" min="0" inputmode="numeric" value="${packagingCostOf(st)}">
+          </label>
+          <div class="wide actions">
+            <button class="btn small" type="submit">保存</button>
+          </div>
+        </form>
+        <p class="muted">新しく作るセットの原価に入ります。作済みのセットの原価は変わりません。</p>
+      </div>`;
+  }
+
   function viewSettings({ st }) {
     return {
       title: '設定',
@@ -1066,7 +1342,8 @@
         <p class="muted">分類・仕入れ先・販売先の選択肢を変更します。名前を変えても既存の記録の名前は変わりません。販売先の手数料は販売記録の入力時に自動で入ります。</p>
         ${masterSection(st, 'category', '分類')}
         ${masterSection(st, 'supplier', '仕入れ先')}
-        ${masterSection(st, 'channel', '販売先（手数料）')}`,
+        ${masterSection(st, 'channel', '販売先（手数料）')}
+        ${packagingSection(st)}`,
     };
   }
 
@@ -1095,7 +1372,7 @@
         </div>
         <h2>復元</h2>
         <div class="card">
-          <p class="muted">復元すると、現在のデータはすべて置き換えられます。このバージョン（v2）で作成したバックアップのみ復元できます。</p>
+          <p class="muted">復元すると、現在のデータはすべて置き換えられます。v2・v3（備品を含む）で作成したバックアップを復元できます。</p>
           <form class="grid" data-form="restore">
             <label class="wide">バックアップファイル（.json）
               <input type="file" name="file" accept=".json,application/json">
@@ -1209,6 +1486,35 @@
     });
   }
 
+  // Click order of 構成品 in the picker. The first item becomes the cover photo.
+  function updateItemOrder(form, el) {
+    const field = form.elements.item_order;
+    const order = field.value ? field.value.split(',').map(Number) : [];
+    const id = Number(el.value);
+    const next = el.checked
+      ? (order.includes(id) ? order : [...order, id])
+      : order.filter((x) => x !== id);
+    field.value = next.join(',');
+  }
+
+  // Selected 備品 for a set. Unit cost is snapshotted when the 備品 is first added to the set.
+  function supplySelection(form, st, d, existing) {
+    const picked = new Set(Array.from(form.querySelectorAll('input[name="supply"]:checked'), (el) => el.value));
+    const kept = existing?.supplies || [];
+    const result = [];
+    if (picked.has('packaging')) {
+      const old = kept.find((x) => x.kind === 'packaging');
+      result.push({ kind: 'packaging', name: '梱包材', qty: 1, unit_cost: old ? old.unit_cost : packagingCostOf(st) });
+    }
+    SUPPLY_KINDS.forEach(({ kind, name }) => {
+      if (!picked.has(kind)) return;
+      const old = kept.find((x) => x.kind === kind);
+      if (!old && d.supplyStock[kind].left < 1) throw new FormError(`${name}の在庫がありません`);
+      result.push({ kind, name, qty: 1, unit_cost: old ? old.unit_cost : d.supplyStock[kind].unit });
+    });
+    return result;
+  }
+
   async function saveSet(form) {
     const id = Number(form.dataset.id) || null;
     const name = fieldText(form, 'name');
@@ -1217,9 +1523,12 @@
       Array.from(form.querySelectorAll('input[name="item_ids"]:checked'), (el) => Number(el.value)),
     );
     const st = await loadState();
+    const d = derive(st);
     const existing = id == null ? null : st.sets.find((s) => s.id === id);
     if (id != null && !existing) throw new FormError('セットが見つかりません');
     if (existing && st.sales.some((s) => s.set_id === id)) throw new FormError('販売済みのセットは編集できません');
+    const order = fieldText(form, 'item_order').split(',').map(Number).filter((x) => selected.has(x));
+    const coverId = [...order, ...selected].find((x) => selected.has(x)) ?? null;
     const data = {
       status: '出品前',
       list_price: 0,
@@ -1228,6 +1537,8 @@
       ...existing,
       name,
       description: fieldText(form, 'description'),
+      cover_item_id: coverId,
+      supplies: supplySelection(form, st, d, existing),
     };
     const { id: setId } = await dbTx(['sets'], 'readwrite', (s) => ({
       id: existing ? s.sets.put(data) : s.sets.add(data),
@@ -1280,16 +1591,25 @@
       sold_on: fieldDate(form, 'sold_on'),
       channel: fieldChoice(form, 'channel', allowed(namesOf(st, 'channel'), set.list_channel, existing?.channel)),
       sale_price: fieldInt(form, 'sale_price'),
-      shipping_charged: fieldInt(form, 'shipping_charged'),
       platform_fee: fieldInt(form, 'platform_fee'),
       shipping_cost: fieldInt(form, 'shipping_cost'),
+      shipped: form.elements.shipped?.checked === true,
       memo: fieldText(form, 'memo'),
     };
     await dbTx(['sales'], 'readwrite', (s) => {
       if (existing) s.sales.put({ ...values, id: existing.id, set_id: setId });
       else s.sales.add({ ...values, set_id: setId });
     });
-    notify(existing ? '販売内容を更新しました' : '販売を記録しました');
+    notify(existing ? '売却内容を更新しました' : '売却済みにしました');
+    render();
+  }
+
+  async function setShipped(saleId, shipped) {
+    const st = await loadState();
+    const sale = st.sales.find((s) => s.id === saleId);
+    if (!sale) return render();
+    await dbTx(['sales'], 'readwrite', (s) => { s.sales.put({ ...sale, shipped }); });
+    notify(shipped ? '発送済みにしました' : '発送済みを取り消しました');
     render();
   }
 
@@ -1408,6 +1728,44 @@
     return render();
   }
 
+  /* ---------- 備品 / settings ---------- */
+
+  async function saveSupply(form) {
+    const kind = fieldChoice(form, 'kind', SUPPLY_KINDS.map((k) => k.kind));
+    const count = fieldInt(form, 'count');
+    if (count <= 0) throw new FormError('数は1以上で入力してください');
+    const data = {
+      kind,
+      purchased_on: fieldDate(form, 'purchased_on'),
+      count,
+      total: fieldInt(form, 'total'),
+      memo: fieldText(form, 'memo'),
+    };
+    await dbTx(['supply_purchases'], 'readwrite', (s) => { s.supply_purchases.add(data); });
+    notify('備品を登録しました');
+    render();
+  }
+
+  async function deleteSupply(id) {
+    const st = await loadState();
+    const purchase = st.supply_purchases.find((p) => p.id === id);
+    if (!purchase) return render();
+    const rest = { ...st, supply_purchases: st.supply_purchases.filter((p) => p.id !== id) };
+    if (derive(rest).supplyStock[purchase.kind].left < 0) {
+      throw new FormError('この購入分はセットで使用中のため削除できません');
+    }
+    await dbTx(['supply_purchases'], 'readwrite', (s) => { s.supply_purchases.delete(id); });
+    notify('削除しました');
+    render();
+  }
+
+  async function savePackaging(form) {
+    const data = { key: 'packaging_cost', value: fieldInt(form, 'packaging_cost') };
+    await dbTx(['settings'], 'readwrite', (s) => { s.settings.put(data); });
+    notify('梱包材の単価を保存しました');
+    render();
+  }
+
   /* ---------- CSV / backup ---------- */
 
   function download(blob, filename) {
@@ -1438,18 +1796,19 @@
       ]),
     ],
     sets: (st, d) => [
-      ['ID', 'セット名', '状態', '出品先', '出品価格', '出品日', '構成品', '原価', '販売日', '販売先', '販売価格', '送料受取', '手数料', '発送料', '利益'],
+      ['ID', 'セット名', '状態', '出品先', '出品価格', '出品日', '構成品', '備品', '原価', '販売日', '販売先', '販売価格', '手数料', '発送料', '利益'],
       d.setRows.map((s) => [
-        s.id, s.name, s.display_status, s.list_channel, s.list_price, s.listed_on, s.item_names, s.cost,
-        s.sale?.sold_on, s.sale?.channel, s.sale?.sale_price, s.sale?.shipping_charged,
+        s.id, s.name, s.display_status, s.list_channel, s.list_price, s.listed_on, s.item_names,
+        s.supplies.map((x) => `${x.name}×${x.qty}`).join(' / '), s.cost,
+        s.sale?.sold_on, s.sale?.channel, s.sale?.sale_price,
         s.sale?.platform_fee, s.sale?.shipping_cost, s.profit,
       ]),
     ],
     sales: (st, d) => [
-      ['ID', '販売日', 'セット名', '販売先', '販売価格', '送料受取', '手数料', '発送料', '売上合計', 'メモ'],
+      ['ID', '販売日', 'セット名', '販売先', '販売価格', '手数料', '発送料', '発送済み', 'メモ'],
       [...st.sales].sort(byDateThenId('sold_on')).map((s) => [
-        s.id, s.sold_on, d.setById.get(s.set_id)?.name, s.channel, s.sale_price, s.shipping_charged,
-        s.platform_fee, s.shipping_cost, s.sale_price + s.shipping_charged, s.memo,
+        s.id, s.sold_on, d.setById.get(s.set_id)?.name, s.channel, s.sale_price,
+        s.platform_fee, s.shipping_cost, s.shipped ? '済' : '未', s.memo,
       ]),
     ],
     expenses: (st) => [
@@ -1505,10 +1864,17 @@
       throw new FormError('JSONの形式が正しくありません');
     }
     if (backup?.app !== 'kimono_site') throw new FormError('着物販売管理のバックアップファイルではありません');
-    if (backup.version !== BACKUP_VERSION) throw new FormError('このバージョンには対応していないバックアップです');
+    if (![2, BACKUP_VERSION].includes(backup.version)) throw new FormError('このバージョンには対応していないバックアップです');
     const data = backup.data;
-    const valid = data && [...DATA_KEYS, 'photo_files'].every((k) => Array.isArray(data[k]));
+    const valid = data && ['masters', 'purchases', 'items', 'sets', 'sales', 'expenses', 'photos', 'photo_files']
+      .every((k) => Array.isArray(data[k]));
     if (!valid) throw new FormError('バックアップの内容が正しくありません');
+    // v2 backups predate 備品 and settings, and still contain the retired 帯紐 category.
+    DATA_KEYS.forEach((k) => { if (!Array.isArray(data[k])) data[k] = []; });
+    if (backup.version === 2) {
+      data.masters = data.masters.filter((m) => !(m.kind === 'category' && m.name === '帯紐'));
+      data.items = data.items.map((i) => (i.category === '帯紐' ? { ...i, category: 'その他' } : i));
+    }
     if (!confirm('現在のデータはすべて置き換えられます。よろしいですか？')) return;
     const blobs = await Promise.all(data.photo_files.map(async (f) => ({
       id: f.id,
@@ -1532,6 +1898,8 @@
     listing: saveListing,
     sale: saveSale,
     expense: saveExpense,
+    supply: saveSupply,
+    packaging: savePackaging,
     master: saveMaster,
     'master-new': addMaster,
     restore: restoreBackup,
@@ -1563,6 +1931,7 @@
       case 'unlist': return unlistSet(Number(data.id));
       case 'cancel-sale': return cancelSale(Number(data.id));
       case 'delete-expense': return deleteExpense(Number(data.id));
+      case 'delete-supply': return deleteSupply(Number(data.id));
       case 'delete-master': return deleteMaster(Number(data.id));
       case 'delete-photo':
         await deletePhotos([data.id]);
@@ -1638,6 +2007,11 @@
       go(el.dataset.nav + encodeURIComponent(el.value));
       return;
     }
+    if (el.dataset?.shippedId) {
+      setShipped(Number(el.dataset.shippedId), el.checked);
+      return;
+    }
+    if (el.name === 'item_ids' && el.form?.dataset.form === 'set') updateItemOrder(el.form, el);
     if (el.form?.dataset.form === 'sale' && el.name === 'channel') updateSaleFee(el.form);
   });
 

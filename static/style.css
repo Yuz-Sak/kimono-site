@@ -241,3 +241,74 @@ img.cover { display: block; }
   main { padding: 10px; }
   .kpi .value { font-size: 1.1rem; }
 }
+
+.check {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 0;
+  color: var(--ink);
+}
+.check input[type="checkbox"] { width: auto; margin: 0; }
+
+/* Set picker: pick photos from 仕入れ品 */
+.picks {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(120px, 1fr));
+  gap: 10px;
+  margin-top: 8px;
+}
+.pick {
+  position: relative;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  padding: 8px;
+  border: 2px solid var(--line);
+  border-radius: 10px;
+  background: #fff;
+  color: var(--ink);
+  cursor: pointer;
+}
+.pick input {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  margin: 0;
+  padding: 0;
+  border: 0;
+  opacity: 0;
+}
+.pick img {
+  display: block;
+  width: 100%;
+  aspect-ratio: 3 / 4;
+  object-fit: cover;
+  border-radius: 6px;
+  background: #eee;
+}
+.pick-none {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  aspect-ratio: 3 / 4;
+  border-radius: 6px;
+  background: #eee;
+  color: var(--muted);
+  font-size: 0.85rem;
+}
+.pick:has(input:checked) { border-color: var(--accent); background: #fbf1f2; }
+.pick:has(input:disabled) { opacity: 0.5; cursor: not-allowed; }
+
+/* Report dashboard */
+.dash h3 { margin: 0 0 10px; font-size: 1rem; }
+.chart svg { display: block; width: 100%; height: auto; }
+.chart .bar.plus { fill: var(--good); }
+.chart .bar.minus { fill: var(--bad); }
+.chart line.axis { stroke: var(--line); stroke-width: 1; }
+.chart text.axis { fill: var(--muted); font-size: 11px; }
+.pie { display: flex; flex-wrap: wrap; align-items: center; gap: 16px 24px; }
+.pie-svg { flex: 0 0 200px; width: 200px; height: 200px; }
+.legend { list-style: none; margin: 0; padding: 0; }
+.legend li { display: flex; align-items: center; gap: 8px; margin: 6px 0; }
+.swatch { display: inline-block; flex: 0 0 12px; width: 12px; height: 12px; border-radius: 3px; }
