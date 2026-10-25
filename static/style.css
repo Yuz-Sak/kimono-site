@@ -187,6 +187,55 @@ img.cover { display: block; }
 }
 .photos form { margin-top: 6px; }
 
+.tabs { display: flex; flex-wrap: wrap; gap: 6px; margin: 8px 0; }
+.tab {
+  padding: 6px 12px;
+  border: 1px solid var(--line);
+  border-radius: 99px;
+  background: #fff;
+  color: var(--accent);
+  font-size: 0.9rem;
+  text-decoration: none;
+}
+.tab.active { background: var(--accent); color: #fff; }
+
+.badge.listed { background: #e3ecf7; color: #2a4d7a; }
+
+.rows td { vertical-align: top; }
+.rows input, .rows select { margin: 0; padding: 6px 8px; }
+.num-input { width: 110px; }
+
+.master-row {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+  margin-bottom: 10px;
+}
+.master-row input { flex: 1 1 160px; width: auto; margin: 0; }
+.master-row .fee { display: flex; align-items: center; gap: 4px; }
+.master-row .fee input { flex: none; width: 80px; }
+
+.toast {
+  position: fixed;
+  left: 50%;
+  bottom: 24px;
+  transform: translateX(-50%);
+  max-width: 90vw;
+  padding: 12px 18px;
+  border-radius: 10px;
+  background: var(--good);
+  color: #fff;
+  font-weight: bold;
+  box-shadow: 0 4px 12px rgba(0, 0, 0, 0.2);
+  opacity: 0;
+  pointer-events: none;
+  transition: opacity 0.25s;
+  z-index: 10;
+}
+.toast.show { opacity: 1; }
+.toast.error { background: var(--bad); }
+
 @media (max-width: 600px) {
   body { font-size: 15px; }
   main { padding: 10px; }
