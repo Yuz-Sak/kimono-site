@@ -114,6 +114,7 @@ textarea { min-height: 80px; }
 .plus { color: var(--good); }
 .minus { color: var(--bad); }
 .pre { white-space: pre-wrap; }
+#sync-status.error { color: #ffb4a8; }
 
 .flash {
   padding: 10px 14px;

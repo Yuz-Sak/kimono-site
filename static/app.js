@@ -37,6 +37,9 @@
   const BACKUP_VERSION = 3;
   // Pending sync changes: one entry per record, and the latest change replaces earlier ones.
   const OUTBOX = 'outbox';
+  const SYNC_KEY = 'kimono_sync';
+  const SYNC_BATCH = 200;
+  const PULL_PAGE = 500;
   const MAX_PHOTO_SIZE = 1600;
   // Stores whose record ids are UUIDs, the reference fields that point at them, and the stores rewritten on id migration.
   const ID_STORES = ['masters', 'purchases', 'items', 'sets', 'sales', 'expenses', 'supply_purchases'];
@@ -50,12 +53,26 @@
 
   const main = document.getElementById('app');
   const pendingEl = document.getElementById('pending');
+  const syncStatusEl = document.getElementById('sync-status');
+  const syncButton = document.getElementById('sync-button');
   const objectUrls = [];
   let dbPromise = null;
   let renderSeq = 0;
   let toastTimer = null;
+  let accessToken = null;
+  let accessExpiresAt = 0;
+  let syncRunning = false;
+  let syncQueued = false;
+  let remoteWaiting = false;
 
   class FormError extends Error {}
+
+  class SyncError extends Error {
+    constructor(message, needsLogin = false) {
+      super(message);
+      this.needsLogin = needsLogin;
+    }
+  }
 
   // Record ids are UUID strings. seq is the creation order used for sorting in place of the old numeric ids.
   const newId = () => (crypto.randomUUID
@@ -146,7 +163,7 @@
   }
 
   function queueChange(outbox, store, id, deleted) {
-    outbox.put({ store, id, deleted });
+    outbox.put({ store, id, deleted, seq: nextSeq() });
   }
 
   function pendingCount() {
@@ -1394,7 +1411,8 @@
         ${masterSection(st, 'category', '分類')}
         ${masterSection(st, 'supplier', '仕入れ先')}
         ${masterSection(st, 'channel', '販売先（手数料）')}
-        ${packagingSection(st)}`,
+        ${packagingSection(st)}
+        ${syncSection()}`,
     };
   }
 
@@ -2007,6 +2025,385 @@
     notify('データを変換しました');
   }
 
+  /* ---------- Sync (Supabase) ---------- */
+
+  // Connection settings are kept per browser. They are not part of the synced data or backups.
+  function loadSync() {
+    try {
+      return JSON.parse(localStorage.getItem(SYNC_KEY)) || {};
+    } catch (err) {
+      return {};
+    }
+  }
+
+  function saveSync(patch) {
+    localStorage.setItem(SYNC_KEY, JSON.stringify({ ...loadSync(), ...patch }));
+  }
+
+  function isSyncConfigured() {
+    const cfg = loadSync();
+    return Boolean(cfg.url && cfg.key);
+  }
+
+  // Plain http is allowed only for localhost, for local testing.
+  function isAllowedUrl(url) {
+    try {
+      const u = new URL(url);
+      return u.protocol === 'https:' || (u.protocol === 'http:' && ['127.0.0.1', 'localhost'].includes(u.hostname));
+    } catch (err) {
+      return false;
+    }
+  }
+
+  function setSyncState(text, isError = false) {
+    syncStatusEl.textContent = text;
+    syncStatusEl.classList.toggle('error', isError);
+  }
+
+  async function refreshPending() {
+    pendingEl.textContent = `未送信 ${await pendingCount()}件`;
+  }
+
+  function setSession(data) {
+    accessToken = data.access_token;
+    accessExpiresAt = Date.now() + data.expires_in * 1000;
+    saveSync({ refreshToken: data.refresh_token });
+  }
+
+  function forgetSession() {
+    accessToken = null;
+    accessExpiresAt = 0;
+  }
+
+  async function authRequest(grant, body) {
+    const cfg = loadSync();
+    let res;
+    try {
+      res = await fetch(`${cfg.url}/auth/v1/token?grant_type=${grant}`, {
+        method: 'POST',
+        headers: { apikey: cfg.key, 'Content-Type': 'application/json' },
+        body: JSON.stringify(body),
+      });
+    } catch (err) {
+      throw new SyncError('通信できませんでした。ネットワークを確認してください');
+    }
+    if (res.ok) return res.json();
+    const rejected = [400, 401, 403].includes(res.status);
+    if (grant === 'password') {
+      throw new SyncError(rejected ? 'メールアドレスかパスワードが正しくありません' : '認証サーバーに接続できませんでした');
+    }
+    if (rejected) throw new SyncError('ログインの期限が切れました。もう一度ログインしてください', true);
+    throw new SyncError('認証サーバーに接続できませんでした');
+  }
+
+  async function getAccessToken() {
+    if (accessToken && Date.now() < accessExpiresAt - 60000) return accessToken;
+    const { refreshToken } = loadSync();
+    if (!refreshToken) throw new SyncError('ログインしてください', true);
+    try {
+      setSession(await authRequest('refresh_token', { refresh_token: refreshToken }));
+    } catch (err) {
+      if (err.needsLogin) saveSync({ refreshToken: null });
+      throw err;
+    }
+    return accessToken;
+  }
+
+  // Calls the records table through PostgREST. A 401 is retried once with a fresh token.
+  async function restRequest(path, { method = 'GET', body, prefer, retry = true } = {}) {
+    const cfg = loadSync();
+    const token = await getAccessToken();
+    const headers = { apikey: cfg.key, Authorization: `Bearer ${token}` };
+    if (body !== undefined) headers['Content-Type'] = 'application/json';
+    if (prefer) headers.Prefer = prefer;
+    const res = await fetch(`${cfg.url}/rest/v1/${path}`, {
+      method,
+      headers,
+      body: body === undefined ? undefined : JSON.stringify(body),
+    });
+    if (res.status === 401 && retry) {
+      forgetSession();
+      return restRequest(path, { method, body, prefer, retry: false });
+    }
+    if (!res.ok) throw new SyncError(`サーバーとの同期に失敗しました（${res.status}）`);
+    return method === 'GET' ? res.json() : null;
+  }
+
+  function readOutbox() {
+    return dbTx([OUTBOX], 'readonly', (s) => ({ entries: s.outbox.getAll() })).then((r) => r.entries);
+  }
+
+  // Removes sent entries. An entry changed again during the request is kept.
+  function clearSent(sent) {
+    return openDb().then((db) => new Promise((resolve, reject) => {
+      const tx = db.transaction(OUTBOX, 'readwrite');
+      const outbox = tx.objectStore(OUTBOX);
+      sent.forEach((entry) => {
+        outbox.get([entry.store, entry.id]).onsuccess = (e) => {
+          const current = e.target.result;
+          if (current && current.seq === entry.seq) outbox.delete([entry.store, entry.id]);
+        };
+      });
+      tx.oncomplete = () => resolve();
+      tx.onerror = () => reject(tx.error);
+      tx.onabort = () => reject(tx.error || new Error('transaction aborted'));
+    }));
+  }
+
+  // Queues every synced record so the first push uploads all data on this device.
+  function enqueueAll() {
+    return openDb().then((db) => new Promise((resolve, reject) => {
+      const tx = db.transaction([...DATA_KEYS, OUTBOX], 'readwrite');
+      const outbox = tx.objectStore(OUTBOX);
+      DATA_KEYS.forEach((name) => {
+        const store = tx.objectStore(name);
+        store.getAll().onsuccess = (e) => {
+          e.target.result.forEach((row) => queueChange(outbox, name, row[store.keyPath], false));
+        };
+      });
+      tx.oncomplete = () => resolve();
+      tx.onerror = () => reject(tx.error);
+      tx.onabort = () => reject(tx.error || new Error('transaction aborted'));
+    }));
+  }
+
+  // jsonb reorders keys on the server, so keys are sorted before comparing.
+  function sortKeys(value) {
+    if (Array.isArray(value)) return value.map(sortKeys);
+    if (value && typeof value === 'object') {
+      return Object.fromEntries(Object.keys(value).sort().map((k) => [k, sortKeys(value[k])]));
+    }
+    return value;
+  }
+
+  function sameRecord(local, remote) {
+    if (local === undefined) return false;
+    const normalized = JSON.parse(JSON.stringify(local));
+    return JSON.stringify(sortKeys(normalized)) === JSON.stringify(sortKeys(remote));
+  }
+
+  // Writes server rows without queuing them. A record with an unsent local change is left alone.
+  function applyRows(rows) {
+    return openDb().then((db) => new Promise((resolve, reject) => {
+      const tx = db.transaction([...DATA_KEYS, OUTBOX], 'readwrite');
+      const outbox = tx.objectStore(OUTBOX);
+      let changed = 0;
+      rows.filter((row) => DATA_KEYS.includes(row.store)).forEach((row) => {
+        outbox.get([row.store, row.id]).onsuccess = (e) => {
+          if (e.target.result) return;
+          const store = tx.objectStore(row.store);
+          store.get(row.id).onsuccess = (ev) => {
+            const local = ev.target.result;
+            if (row.deleted) {
+              if (local === undefined) return;
+              store.delete(row.id);
+            } else {
+              if (sameRecord(local, row.data)) return;
+              store.put(row.data);
+            }
+            changed += 1;
+          };
+        };
+      });
+      tx.oncomplete = () => resolve(changed > 0);
+      tx.onerror = () => reject(tx.error);
+      tx.onabort = () => reject(tx.error || new Error('transaction aborted'));
+    }));
+  }
+
+  // A put sends the current value. A value that no longer exists is sent as a tombstone.
+  async function outboxRows(batch) {
+    const live = batch.filter((e) => !e.deleted);
+    const values = live.length
+      ? await dbTx([...new Set(live.map((e) => e.store))], 'readonly', (s) => (
+        Object.fromEntries(live.map((e, i) => [i, s[e.store].get(e.id)]))
+      ))
+      : {};
+    let n = 0;
+    return batch.map((e) => {
+      if (e.deleted) return { store: e.store, id: e.id, data: {}, deleted: true };
+      const value = values[n];
+      n += 1;
+      return value
+        ? { store: e.store, id: e.id, data: value, deleted: false }
+        : { store: e.store, id: e.id, data: {}, deleted: true };
+    });
+  }
+
+  async function pushPending() {
+    const entries = await readOutbox();
+    for (let i = 0; i < entries.length; i += SYNC_BATCH) {
+      const batch = entries.slice(i, i + SYNC_BATCH);
+      await restRequest('records?on_conflict=store,id', {
+        method: 'POST',
+        body: await outboxRows(batch),
+        prefer: 'resolution=merge-duplicates,return=minimal',
+      });
+      await clearSent(batch);
+    }
+  }
+
+  // Reads from the last seen updated_at. The last row is read again and skipped by sameRecord.
+  async function pullChanges() {
+    let cursor = loadSync().cursor;
+    for (;;) {
+      const since = cursor ? `&updated_at=gte.${encodeURIComponent(cursor)}` : '';
+      const rows = await restRequest(`records?select=store,id,data,deleted,updated_at&order=updated_at.asc&limit=${PULL_PAGE}${since}`);
+      if (!rows.length) return;
+      if (await applyRows(rows)) remoteWaiting = true;
+      const last = rows[rows.length - 1].updated_at;
+      if (rows.length === PULL_PAGE && last === cursor) throw new SyncError('同じ時刻の変更が多すぎるため、受信できません');
+      cursor = last;
+      saveSync({ cursor });
+      if (rows.length < PULL_PAGE) return;
+    }
+  }
+
+  // Owner: uploads this device's data when the server is empty.
+  // Worker: replaces this device's data with the server data. The seed masters are discarded.
+  async function initialSync() {
+    const { role } = loadSync();
+    const remote = await restRequest('records?select=store&limit=1');
+    if (role === 'worker') {
+      if (!remote.length) throw new SyncError('サーバーにデータがありません。先にオーナーの端末で同期してください');
+      if ((await readOutbox()).length) throw new SyncError('未送信の変更があるため、この端末のデータを置き換えられません');
+      await dbTx(STORE_NAMES, 'readwrite', (s) => {
+        STORE_NAMES.forEach((name) => { s[name].clear(); });
+      });
+      saveSync({ cursor: null, initialDone: true });
+      return;
+    }
+    if (remote.length) throw new SyncError('サーバーにデータがあります。作業者として接続するか、サーバーの内容を確認してください');
+    await enqueueAll();
+    saveSync({ initialDone: true });
+  }
+
+  async function runSync() {
+    setSyncState('同期中…');
+    try {
+      if (!loadSync().initialDone) await initialSync();
+      await pushPending();
+      await pullChanges();
+      setSyncState(`同期済み ${new Date().toLocaleTimeString('ja-JP', { hour: '2-digit', minute: '2-digit' })}`);
+    } catch (err) {
+      console.error(err);
+      setSyncState(err instanceof SyncError ? err.message : '通信できませんでした。あとでもう一度お試しください', true);
+    }
+    if (remoteWaiting && !formIsDirty()) {
+      render();
+      return;
+    }
+    refreshPending();
+    if (remoteWaiting) setSyncState('他の端末の更新があります（入力中のため未反映）');
+  }
+
+  function requestSync() {
+    const cfg = loadSync();
+    if (!cfg.url || !cfg.key) {
+      setSyncState('');
+      return;
+    }
+    if (!cfg.refreshToken) {
+      setSyncState('未ログイン（設定画面でログインしてください）', true);
+      return;
+    }
+    if (syncRunning) {
+      syncQueued = true;
+      return;
+    }
+    syncRunning = true;
+    runSync().finally(() => {
+      syncRunning = false;
+      if (syncQueued) {
+        syncQueued = false;
+        requestSync();
+      }
+    });
+  }
+
+  // True when the user has typed into a form, so the screen is not redrawn over the input.
+  function formIsDirty() {
+    return Array.from(main.querySelectorAll('form input, form textarea, form select')).some((el) => {
+      if (el.type === 'file') return el.files.length > 0;
+      if (el.type === 'checkbox' || el.type === 'radio') return el.checked !== el.defaultChecked;
+      if (el.tagName === 'SELECT') return Array.from(el.options).some((o) => o.selected !== o.defaultSelected);
+      return el.value !== el.defaultValue;
+    });
+  }
+
+  function syncSection() {
+    const cfg = loadSync();
+    const role = cfg.role === 'worker' ? 'worker' : 'owner';
+    const login = cfg.refreshToken
+      ? `<p>ログイン中：${esc(cfg.email || '')}</p>
+         <div class="actions"><button class="btn sub small" type="button" data-action="sync-logout">ログアウト</button></div>`
+      : `<form class="grid" data-form="sync-login">
+           <label>メールアドレス
+             <input type="email" name="email" autocomplete="username">
+           </label>
+           <label>パスワード
+             <input type="password" name="password" autocomplete="current-password">
+           </label>
+           <div class="wide actions"><button class="btn small" type="submit">ログイン</button></div>
+         </form>`;
+    return `
+      <h2>同期</h2>
+      <div class="card">
+        <form class="grid" data-form="sync-config">
+          <label class="wide">Project URL
+            <input name="url" value="${esc(cfg.url || '')}" placeholder="https://xxxx.supabase.co" autocomplete="off">
+          </label>
+          <label class="wide">公開キー
+            <input name="key" value="${esc(cfg.key || '')}" autocomplete="off">
+          </label>
+          <label>この端末の役割
+            <select name="role">${opt('owner', 'オーナー', role === 'owner')}${opt('worker', '作業者', role === 'worker')}</select>
+          </label>
+          <div class="wide actions"><button class="btn small" type="submit">接続情報を保存</button></div>
+        </form>
+        <p class="muted">オーナーは、この端末のデータを最初にすべてサーバーへ送ります。作業者は、初回にこの端末のデータをサーバーの内容で置き換えます。接続情報はこの端末だけに保存され、バックアップには含まれません。</p>
+      </div>
+      <div class="card">${login}</div>`;
+  }
+
+  async function saveSyncConfig(form) {
+    const url = fieldText(form, 'url').replace(/\/+$/, '');
+    const key = fieldText(form, 'key');
+    const role = fieldChoice(form, 'role', ['owner', 'worker']);
+    if (!isAllowedUrl(url)) throw new FormError('Project URL は https:// で始まるアドレスを入力してください');
+    if (!key) throw new FormError('公開キーを入力してください');
+    const old = loadSync();
+    if (old.url === url && old.key === key) {
+      saveSync({ role });
+    } else {
+      forgetSession();
+      saveSync({ url, key, role, refreshToken: null, email: null, cursor: null, initialDone: false });
+    }
+    notify('接続情報を保存しました');
+    requestSync();
+    render();
+  }
+
+  async function loginSync(form) {
+    const email = fieldText(form, 'email');
+    const password = form.elements.password.value;
+    if (!isSyncConfigured()) throw new FormError('先に接続情報を保存してください');
+    if (!email || !password) throw new FormError('メールアドレスとパスワードを入力してください');
+    setSession(await authRequest('password', { email, password }));
+    saveSync({ email });
+    notify('ログインしました');
+    requestSync();
+    render();
+  }
+
+  function logoutSync() {
+    forgetSession();
+    saveSync({ refreshToken: null, email: null });
+    notify('ログアウトしました');
+    requestSync();
+    return render();
+  }
+
   /* ---------- Dispatch ---------- */
 
   const formHandlers = {
@@ -2021,6 +2418,8 @@
     master: saveMaster,
     'master-new': addMaster,
     restore: restoreBackup,
+    'sync-config': saveSyncConfig,
+    'sync-login': loginSync,
   };
 
   const rowActions = {
@@ -2056,12 +2455,13 @@
         return render();
       case 'csv': return exportCsv(data.kind);
       case 'backup': return downloadBackup();
+      case 'sync-logout': return logoutSync();
       default: return undefined;
     }
   }
 
   function reportError(err) {
-    if (err instanceof FormError) {
+    if (err instanceof FormError || err instanceof SyncError) {
       alert(err.message);
       return;
     }
@@ -2080,6 +2480,7 @@
       if (seq !== renderSeq) return;
       document.title = `${page.title} | 着物販売管理`;
       main.innerHTML = page.html;
+      remoteWaiting = false;
       pendingEl.textContent = `未送信 ${pending}件`;
     } catch (err) {
       console.error(err);
@@ -2157,11 +2558,25 @@
     }
   });
 
-  window.addEventListener('hashchange', render);
+  window.addEventListener('hashchange', () => {
+    render();
+    requestSync();
+  });
+  window.addEventListener('online', () => requestSync());
+  syncButton.addEventListener('click', () => {
+    if (!isSyncConfigured()) {
+      notify('設定画面で接続情報を入力してください', 'error');
+      return;
+    }
+    requestSync();
+  });
   migrateNumericIds()
     .catch((err) => {
       console.error(err);
       alert('データの変換に失敗しました。データは変更されていません。');
     })
-    .finally(render);
+    .finally(() => {
+      render();
+      requestSync();
+    });
 })();
