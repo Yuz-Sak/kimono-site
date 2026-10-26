@@ -40,6 +40,8 @@
   const SYNC_KEY = 'kimono_sync';
   const SYNC_BATCH = 200;
   const PULL_PAGE = 500;
+  const AUTO_SYNC_DELAY = 1200;
+  const AUTO_SYNC_COOLDOWN = 15000;
   const MAX_PHOTO_SIZE = 1600;
   // Stores whose record ids are UUIDs, the reference fields that point at them, and the stores rewritten on id migration.
   const ID_STORES = ['masters', 'purchases', 'items', 'sets', 'sales', 'expenses', 'supply_purchases'];
@@ -56,6 +58,7 @@
   const syncStatusEl = document.getElementById('sync-status');
   const syncButton = document.getElementById('sync-button');
   const objectUrls = [];
+  const pendingPhotoDownloads = new Map();
   let dbPromise = null;
   let renderSeq = 0;
   let toastTimer = null;
@@ -64,6 +67,8 @@
   let syncRunning = false;
   let syncQueued = false;
   let remoteWaiting = false;
+  let autoSyncTimer = null;
+  let lastAutoSyncAt = 0;
 
   class FormError extends Error {}
 
@@ -164,6 +169,14 @@
 
   function queueChange(outbox, store, id, deleted) {
     outbox.put({ store, id, deleted, seq: nextSeq() });
+    scheduleAutoSync();
+  }
+
+  function scheduleAutoSync() {
+    if (!loadSync().refreshToken || !navigator.onLine) return;
+    clearTimeout(autoSyncTimer);
+    const cooldown = AUTO_SYNC_COOLDOWN - (Date.now() - lastAutoSyncAt);
+    autoSyncTimer = setTimeout(() => requestAutoSync(), Math.max(AUTO_SYNC_DELAY, cooldown));
   }
 
   function pendingCount() {
@@ -231,6 +244,17 @@
     const files = await dbTx(['photo_files'], 'readonly', (s) => (
       Object.fromEntries(unique.map((id) => [id, s.photo_files.get(id)]))
     ));
+    const missing = unique.filter((id) => !files[id]);
+    if (missing.length && isSyncConfigured() && loadSync().refreshToken) {
+      await Promise.all(missing.map(async (id) => {
+        try {
+          files[id] = await downloadPhotoFile(id);
+        } catch (err) {
+          console.error(err);
+          setSyncState(err instanceof SyncError ? err.message : '写真を取得できませんでした', true);
+        }
+      }));
+    }
     Object.entries(files).forEach(([id, blob]) => {
       if (!blob) return;
       const url = URL.createObjectURL(blob);
@@ -2129,6 +2153,49 @@
     return method === 'GET' ? res.json() : null;
   }
 
+  async function storageRequest(path, { method = 'GET', body, retry = true, allowNotFound = false } = {}) {
+    const cfg = loadSync();
+    const token = await getAccessToken();
+    const headers = { apikey: cfg.key, Authorization: `Bearer ${token}` };
+    let requestBody;
+    if (body instanceof Blob) {
+      headers['Content-Type'] = body.type || 'application/octet-stream';
+      headers['x-upsert'] = 'true';
+      requestBody = body;
+    } else if (body !== undefined) {
+      headers['Content-Type'] = 'application/json';
+      requestBody = JSON.stringify(body);
+    }
+    let res;
+    try {
+      res = await fetch(`${cfg.url}/storage/v1/${path}`, { method, headers, body: requestBody });
+    } catch (err) {
+      throw new SyncError('写真サーバーに接続できませんでした');
+    }
+    if (res.status === 401 && retry) {
+      forgetSession();
+      return storageRequest(path, { method, body, retry: false, allowNotFound });
+    }
+    if (allowNotFound && res.status === 404) return null;
+    if (!res.ok) throw new SyncError(`写真の同期に失敗しました（${res.status}）`);
+    return method === 'GET' ? res.blob() : null;
+  }
+
+  async function downloadPhotoFile(id) {
+    if (pendingPhotoDownloads.has(id)) return pendingPhotoDownloads.get(id);
+    const download = (async () => {
+      const blob = await storageRequest(`object/photos/${encodeURIComponent(id)}`, { allowNotFound: true });
+      if (blob) await dbTx(['photo_files'], 'readwrite', (s) => s.photo_files.put(blob, id));
+      return blob;
+    })();
+    pendingPhotoDownloads.set(id, download);
+    try {
+      return await download;
+    } finally {
+      pendingPhotoDownloads.delete(id);
+    }
+  }
+
   function readOutbox() {
     return dbTx([OUTBOX], 'readonly', (s) => ({ entries: s.outbox.getAll() })).then((r) => r.entries);
   }
@@ -2167,6 +2234,21 @@
     }));
   }
 
+  async function enqueuePhotoBackfill() {
+    const cfg = loadSync();
+    if (cfg.role !== 'owner' || cfg.photoBackfillDone) return;
+    const files = await dbTx(['photos', 'photo_files'], 'readonly', (s) => ({
+      photos: s.photos.getAll(),
+      fileKeys: s.photo_files.getAllKeys(),
+    }));
+    const localFiles = new Set(files.fileKeys);
+    const ids = files.photos.filter((photo) => localFiles.has(photo.id)).map((photo) => photo.id);
+    await dbTx([OUTBOX], 'readwrite', (s) => {
+      ids.forEach((id) => s.outbox.put({ store: 'photos', id, deleted: false, seq: nextSeq() }));
+    });
+    saveSync({ photoBackfillDone: true });
+  }
+
   // jsonb reorders keys on the server, so keys are sorted before comparing.
   function sortKeys(value) {
     if (Array.isArray(value)) return value.map(sortKeys);
@@ -2185,7 +2267,7 @@
   // Writes server rows without queuing them. A record with an unsent local change is left alone.
   function applyRows(rows) {
     return openDb().then((db) => new Promise((resolve, reject) => {
-      const tx = db.transaction([...DATA_KEYS, OUTBOX], 'readwrite');
+      const tx = db.transaction([...DATA_KEYS, 'photo_files', OUTBOX], 'readwrite');
       const outbox = tx.objectStore(OUTBOX);
       let changed = 0;
       rows.filter((row) => DATA_KEYS.includes(row.store)).forEach((row) => {
@@ -2197,6 +2279,7 @@
             if (row.deleted) {
               if (local === undefined) return;
               store.delete(row.id);
+              if (row.store === 'photos') tx.objectStore('photo_files').delete(row.id);
             } else {
               if (sameRecord(local, row.data)) return;
               store.put(row.data);
@@ -2234,11 +2317,23 @@
     const entries = await readOutbox();
     for (let i = 0; i < entries.length; i += SYNC_BATCH) {
       const batch = entries.slice(i, i + SYNC_BATCH);
+      for (const entry of batch.filter((e) => e.store === 'photos' && !e.deleted)) {
+        const result = await dbTx(['photo_files'], 'readonly', (s) => ({ blob: s.photo_files.get(entry.id) }));
+        if (!result.blob) throw new SyncError('同期する写真ファイルがこの端末にありません');
+        await storageRequest(`object/photos/${encodeURIComponent(entry.id)}`, { method: 'POST', body: result.blob });
+      }
       await restRequest('records?on_conflict=store,id', {
         method: 'POST',
         body: await outboxRows(batch),
         prefer: 'resolution=merge-duplicates,return=minimal',
       });
+      for (const entry of batch.filter((e) => e.store === 'photos' && e.deleted)) {
+        await storageRequest('object/photos', {
+          method: 'DELETE',
+          body: { prefixes: [entry.id] },
+          allowNotFound: true,
+        });
+      }
       await clearSent(batch);
     }
   }
@@ -2282,6 +2377,7 @@
     setSyncState('同期中…');
     try {
       if (!loadSync().initialDone) await initialSync();
+      await enqueuePhotoBackfill();
       await pushPending();
       await pullChanges();
       setSyncState(`同期済み ${new Date().toLocaleTimeString('ja-JP', { hour: '2-digit', minute: '2-digit' })}`);
@@ -2319,6 +2415,13 @@
         requestSync();
       }
     });
+  }
+
+  function requestAutoSync() {
+    if (!loadSync().refreshToken || !navigator.onLine) return;
+    if (Date.now() - lastAutoSyncAt < AUTO_SYNC_COOLDOWN) return;
+    lastAutoSyncAt = Date.now();
+    requestSync();
   }
 
   // True when the user has typed into a form, so the screen is not redrawn over the input.
@@ -2560,9 +2663,15 @@
 
   window.addEventListener('hashchange', () => {
     render();
-    requestSync();
+    requestAutoSync();
   });
-  window.addEventListener('online', () => requestSync());
+  window.addEventListener('online', () => {
+    lastAutoSyncAt = 0;
+    requestAutoSync();
+  });
+  document.addEventListener('visibilitychange', () => {
+    if (document.visibilityState === 'visible') requestAutoSync();
+  });
   syncButton.addEventListener('click', () => {
     if (!isSyncConfigured()) {
       notify('設定画面で接続情報を入力してください', 'error');
@@ -2577,6 +2686,6 @@
     })
     .finally(() => {
       render();
-      requestSync();
+      requestAutoSync();
     });
 })();
