@@ -3,7 +3,7 @@
 
   const EXPENSE_CATEGORIES = ['梱包材', '撮影・小物', 'クリーニング・補修', '通信費', '消耗品', 'その他'];
   const SET_STATUSES = ['出品前', '出品中', '売却済み'];
-  const DATA_KEYS = ['masters', 'purchases', 'items', 'sets', 'sales', 'expenses', 'photos', 'supply_purchases', 'settings'];
+  const DATA_KEYS = ['masters', 'purchases', 'items', 'sets', 'sales', 'expenses', 'photos', 'supply_purchases', 'settings', 'receipts'];
   const STORE_NAMES = [...DATA_KEYS, 'photo_files'];
   const STORE_OPTIONS = {
     masters: { keyPath: 'id' },
@@ -16,6 +16,7 @@
     photo_files: {},
     supply_purchases: { keyPath: 'id' },
     settings: { keyPath: 'key' },
+    receipts: { keyPath: 'id' },
     outbox: { keyPath: ['store', 'id'] },
   };
   const SUPPLY_KINDS = [
@@ -33,7 +34,9 @@
     { kind: 'channel', name: '直接', fee_rate: 0 },
   ];
   const DB_NAME = 'kimono_site';
-  const DB_VERSION = 4;
+  const DB_VERSION = 5;
+  const RECEIPT_KINDS = { items: '仕入れ品', expenses: '経費', supplies: '備品' };
+  const RECEIPT_RECENT = 6;
   const BACKUP_VERSION = 3;
   // Pending sync changes: one entry per record, and the latest change replaces earlier ones.
   const OUTBOX = 'outbox';
@@ -564,8 +567,8 @@
     return value;
   }
 
-  function photoGrid(photos, urls, editable) {
-    const figures = photos
+  function photoFigures(photos, urls, editable) {
+    return photos
       .filter((p) => urls.has(p.id))
       .map((p) => `
         <figure>
@@ -573,6 +576,46 @@
           ${editable ? `<button class="btn danger small" type="button" data-action="delete-photo" data-id="${p.id}" data-confirm="この写真を削除しますか？">削除</button>` : ''}
         </figure>`)
       .join('');
+  }
+
+  // Receipts are standalone records (kind + date) with photos attached by receipt_id.
+  async function receiptCards(st, receipts, editable) {
+    if (!receipts.length) return '<p class="muted">領収書はまだありません</p>';
+    const byReceipt = groupBy(st.photos.filter((p) => p.receipt_id != null), (p) => p.receipt_id);
+    const photosOf = (r) => [...(byReceipt.get(r.id) || [])].sort((a, b) => a.created - b.created);
+    const urls = await photoUrls(receipts.flatMap((r) => photosOf(r).map((p) => p.id)));
+    return receipts.map((r) => `
+      <div class="card">
+        <div class="actions">
+          <b>${esc(r.date)}</b>
+          ${editable ? '' : `<span class="muted">${esc(RECEIPT_KINDS[r.kind] || '')}</span>`}
+          ${editable ? `<button class="btn danger small" type="button" data-action="delete-receipt" data-id="${r.id}" data-confirm="この領収書を削除しますか？写真も削除されます。">領収書を削除</button>` : ''}
+        </div>
+        <div class="photos">${photoFigures(photosOf(r), urls, false) || '<p class="muted">写真はありません</p>'}</div>
+      </div>`).join('');
+  }
+
+  async function receiptSection(st, kind) {
+    const recent = st.receipts.filter((r) => r.kind === kind).sort(newestFirst('date')).slice(0, RECEIPT_RECENT);
+    return `
+      <h2>領収書</h2>
+      <form class="card grid" data-form="receipt" data-kind="${kind}">
+        <label>日付
+          <input type="date" name="date" value="${today()}">
+        </label>
+        <label>写真（複数選択可・スマホではカメラでの撮影も可）
+          <input type="file" name="photos" accept="image/*" multiple>
+        </label>
+        <div class="wide actions">
+          <button class="btn" type="submit">領収書を保存</button>
+        </div>
+      </form>
+      ${await receiptCards(st, recent, true)}
+      <p class="muted">最近${RECEIPT_RECENT}件を表示しています。月ごとの一覧は収支表で見られます。金額の計算には影響しません。</p>`;
+  }
+
+  function photoGrid(photos, urls, editable) {
+    const figures = photoFigures(photos, urls, editable);
     return `
       <h2>写真</h2>
       <div class="card"><div class="photos">${figures || '<p class="muted">写真はまだありません</p>'}</div></div>`;
@@ -762,19 +805,21 @@
                 <td><input type="checkbox" data-received-id="${r.id}" aria-label="受取済み"${r.received ? ' checked' : ''}></td>
               </tr>`).join('') || '<tr><td colspan="8" class="muted">該当する仕入れ品はありません</td></tr>'}
           </table>
-        </div>`,
+        </div>
+        ${await receiptSection(st, 'items')}`,
     };
   }
 
   function purchaseRowHtml(categories) {
     return `
       <tr data-row>
-        <td><input name="code" placeholder="例：KJ-001"></td>
-        <td><select name="category">${selectOptions(categories, '')}</select></td>
-        <td><input class="num-input" type="number" name="price" min="0" inputmode="numeric" value="0"></td>
-        <td><input class="num-input" type="number" name="shipping" min="0" inputmode="numeric" value="0" data-role="shipping" data-manual="0"></td>
-        <td><input name="memo"></td>
-        <td class="nowrap">
+        <td data-label="品番"><input name="code" placeholder="例：KJ-001"></td>
+        <td data-label="分類"><select name="category">${selectOptions(categories, '')}</select></td>
+        <td data-label="本体価格（円）"><input class="num-input" type="number" name="price" min="0" inputmode="numeric" value="0"></td>
+        <td data-label="送料（円）"><input class="num-input" type="number" name="shipping" min="0" inputmode="numeric" value="0" data-role="shipping" data-manual="0"></td>
+        <td data-label="メモ"><input name="memo"></td>
+        <td data-label="写真"><input type="file" name="photos" accept="image/*" multiple></td>
+        <td class="nowrap row-actions">
           <button class="btn sub small" type="button" data-action="reset-shipping">送料を平均に戻す</button>
           <button class="btn danger small" type="button" data-action="remove-row">行を削除</button>
         </td>
@@ -808,7 +853,7 @@
           <div class="table-wrap">
             <table class="rows">
               <thead>
-                <tr><th>品番</th><th>分類</th><th class="num">本体価格（円）</th><th class="num">送料（円）</th><th>メモ</th><th></th></tr>
+                <tr><th>品番</th><th>分類</th><th class="num">本体価格（円）</th><th class="num">送料（円）</th><th>メモ</th><th>写真</th><th></th></tr>
               </thead>
               <tbody data-role="rows-body" data-categories="${esc(JSON.stringify(categories))}">
                 ${purchaseRowHtml(categories)}
@@ -930,7 +975,7 @@
     const members = new Set(set ? set.members.map((i) => i.id) : []);
     const orderIds = set ? [...set.members].sort(coverFirst(set.cover_item_id)).map((i) => i.id) : [];
     const picks = available.map((i) => `
-        <label class="pick">
+        <label class="pick" data-search="${esc([i.code, i.category, i.supplier, i.memo, i.purchased_on].join(' ').toLowerCase())}">
           <input type="checkbox" name="item_ids" value="${i.id}"${members.has(i.id) ? ' checked' : ''}>
           ${urls.has(i.thumb) ? `<img src="${urls.get(i.thumb)}" alt="">` : '<span class="pick-none">写真なし</span>'}
           <b>${esc(i.code)}</b>
@@ -962,6 +1007,7 @@
           <div class="wide">
             <h2>構成品</h2>
             <p class="muted">写真をタップして選びます。最初に選んだ品の写真がセットの表示写真になります。</p>
+            <input type="search" data-role="pick-search" placeholder="品番・分類・仕入れ先・メモで検索" autocomplete="off">
             <div class="picks">${picks}</div>
           </div>
           <input type="hidden" name="item_order" value="${orderIds.join(',')}">
@@ -1103,7 +1149,7 @@
     };
   }
 
-  function viewSupplies({ st, d }) {
+  async function viewSupplies({ st, d }) {
     const stockRows = SUPPLY_KINDS.map(({ kind }) => {
       const s = d.supplyStock[kind];
       return `
@@ -1167,11 +1213,12 @@
             <tr><th>購入日</th><th>備品</th><th class="num">数</th><th class="num">総額</th><th class="num">平均単価</th><th>メモ</th><th></th></tr>
             ${history}
           </table>
-        </div>`,
+        </div>
+        ${await receiptSection(st, 'supplies')}`,
     };
   }
 
-  function viewExpenses({ st, query }) {
+  async function viewExpenses({ st, query }) {
     const year = Number(query.get('year')) || new Date().getFullYear();
     const rows = st.expenses
       .filter((e) => e.spent_on.startsWith(`${year}-`))
@@ -1205,7 +1252,8 @@
                 </td>
               </tr>`).join('') || '<tr><td colspan="5" class="muted">この年の経費はまだありません</td></tr>'}
           </table>
-        </div>`,
+        </div>
+        ${await receiptSection(st, 'expenses')}`,
     };
   }
 
@@ -1308,7 +1356,7 @@
       ${period.profit < 0 ? '<p class="muted">赤字の期間は利益を0円として表示しています。</p>' : ''}`;
   }
 
-  function viewReport({ st, query }) {
+  async function viewReport({ st, query }) {
     const currentYear = new Date().getFullYear();
     const yearRaw = query.get('year') ?? String(currentYear);
     const year = yearRaw === 'all' ? null : Number(yearRaw) || currentYear;
@@ -1321,6 +1369,12 @@
     if (year !== null) label = month ? `${year}年${month}月` : `${year}年（年間）`;
     const rows = monthlyRows(st, year);
     const total = totals(rows);
+    const monthReceipts = month
+      ? st.receipts.filter((r) => r.date.startsWith(prefix)).sort(newestFirst('date'))
+      : [];
+    const receiptHtml = month
+      ? `<h2>${label}の領収書</h2>${await receiptCards(st, monthReceipts, false)}`
+      : '<h2>領収書</h2><p class="muted">月を選ぶと、その月の領収書を見られます。</p>';
     const yearSelect = `<select data-nav="#/report?year=">${yearsList(st).map((y) => opt(String(y), `${y}年`, y === year)).join('')}${opt('all', '全期間', year === null)}</select>`;
     const monthSelect = year === null
       ? ''
@@ -1384,7 +1438,8 @@
             <h3>${label}の売上の内訳</h3>
             ${incomePie(period)}
           </div>
-        </div>`,
+        </div>
+        ${receiptHtml}`,
     };
   }
 
@@ -1495,6 +1550,15 @@
     if (label) label.textContent = `送料の内訳合計 ${yen(shown)}（送料合計 ${yen(total)}）`;
   }
 
+  // Selected items stay visible so the current picks are never hidden by a search.
+  function filterPicks(form, text) {
+    const words = text.toLowerCase().split(/\s+/).filter(Boolean);
+    form.querySelectorAll('.pick').forEach((pick) => {
+      const hit = words.every((w) => pick.dataset.search.includes(w));
+      pick.hidden = !(hit || pick.querySelector('input').checked);
+    });
+  }
+
   function updateSaleFee(form) {
     const fee = form.elements.platform_fee;
     if (!fee || fee.dataset.manual === '1') return;
@@ -1516,7 +1580,9 @@
       price: parseYen(row.querySelector('[name="price"]').value),
       shipping: parseYen(row.querySelector('[name="shipping"]').value),
       memo: row.querySelector('[name="memo"]').value.trim(),
-    })).filter((r) => r.code || r.price || r.shipping || r.memo);
+      files: row.querySelector('[name="photos"]').files,
+      id: newId(),
+    })).filter((r) => r.code || r.price || r.shipping || r.memo || r.files.length);
     if (!rows.length) throw new FormError('仕入れ品を1点以上入力してください');
     if (rows.some((r) => !r.code)) throw new FormError('品番を入力してください');
     if (sum(rows.map((r) => r.shipping)) !== shippingTotal) {
@@ -1530,7 +1596,7 @@
     await dbTx(['items'], 'readwrite', (s) => {
       rows.forEach((r) => {
         s.items.add({
-          id: newId(),
+          id: r.id,
           seq: nextSeq(),
           purchase_id: purchaseId,
           code: r.code,
@@ -1545,8 +1611,38 @@
         });
       });
     });
+    for (const r of rows) await addPhotos(r.files, { item_id: r.id, set_id: null });
     notify(`仕入れを登録しました（${rows.length}点）`);
     go('#/items');
+  }
+
+  async function saveReceipt(form) {
+    const kind = form.dataset.kind;
+    if (!RECEIPT_KINDS[kind]) throw new FormError('領収書の種類が正しくありません');
+    const date = fieldDate(form, 'date');
+    const files = form.elements.photos.files;
+    if (!files.length) throw new FormError('領収書の写真を選んでください');
+    const id = newId();
+    await dbTx(['receipts'], 'readwrite', (s) => {
+      s.receipts.add({ id, seq: nextSeq(), kind, date });
+    });
+    await addPhotos(files, { item_id: null, set_id: null, receipt_id: id });
+    notify('領収書を保存しました');
+    await render();
+  }
+
+  async function deleteReceipt(id) {
+    const st = await loadState();
+    const photoIds = st.photos.filter((p) => p.receipt_id === id).map((p) => p.id);
+    await dbTx(['receipts', 'photos', 'photo_files'], 'readwrite', (s) => {
+      s.receipts.delete(id);
+      photoIds.forEach((pid) => {
+        s.photos.delete(pid);
+        s.photo_files.delete(pid);
+      });
+    });
+    notify('領収書を削除しました');
+    return render();
   }
 
   async function saveItem(form) {
@@ -2522,6 +2618,7 @@
     'master-new': addMaster,
     restore: restoreBackup,
     'sync-config': saveSyncConfig,
+    receipt: saveReceipt,
     'sync-login': loginSync,
   };
 
@@ -2559,6 +2656,7 @@
       case 'csv': return exportCsv(data.kind);
       case 'backup': return downloadBackup();
       case 'sync-logout': return logoutSync();
+      case 'delete-receipt': return deleteReceipt(data.id);
       default: return undefined;
     }
   }
@@ -2618,6 +2716,7 @@
       if (el.dataset.role === 'shipping') el.dataset.manual = '1';
       allocateShipping(form);
     }
+    if (el.dataset.role === 'pick-search') filterPicks(form, el.value);
     if (form.dataset.form === 'sale') {
       if (el.dataset.role === 'fee') el.dataset.manual = '1';
       if (el.dataset.role === 'sale-price') updateSaleFee(form);

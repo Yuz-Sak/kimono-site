@@ -241,6 +241,33 @@ img.cover { display: block; }
   body { font-size: 15px; }
   main { padding: 10px; }
   .kpi .value { font-size: 1.1rem; }
+
+  input[type="date"] {
+    min-width: 0;
+    min-height: 44px;
+    text-align: left;
+    -webkit-appearance: none;
+    appearance: none;
+  }
+
+  .rows thead { display: none; }
+  .rows, .rows tbody, .rows tr, .rows td { display: block; width: 100%; }
+  .rows tr {
+    margin-bottom: 12px;
+    padding: 10px;
+    border: 1px solid var(--line);
+    border-radius: 8px;
+  }
+  .rows td { padding: 4px 0; border: 0; }
+  .rows td[data-label]::before {
+    content: attr(data-label);
+    display: block;
+    font-size: 0.85rem;
+    color: var(--muted);
+  }
+  .rows input, .rows select { padding: 10px; font-size: 16px; }
+  .rows .num-input { width: 100%; }
+  .rows .row-actions { display: flex; gap: 8px; flex-wrap: wrap; padding-top: 8px; }
 }
 
 .check {
@@ -299,6 +326,7 @@ img.cover { display: block; }
   font-size: 0.85rem;
 }
 .pick:has(input:checked) { border-color: var(--accent); background: #fbf1f2; }
+.pick[hidden] { display: none; }
 .pick:has(input:disabled) { opacity: 0.5; cursor: not-allowed; }
 
 /* Report dashboard */
