@@ -888,7 +888,28 @@
           </div>
           <div class="actions">
             <button class="btn sub small" type="button" data-action="add-row">+ 行を追加</button>
+            <button class="btn sub small" type="button" data-action="toggle-bulk">まとめ買い</button>
             <span class="muted" data-role="ship-sum"></span>
+          </div>
+          <div class="card bulk" data-role="bulk" hidden>
+            <p class="muted">まとめて買った品の合計金額を個数で割り、1点ずつの行を作ります。</p>
+            <div class="grid">
+              <label>分類
+                <select data-role="bulk-category">${selectOptions(categories, '')}</select>
+              </label>
+              <label>個数
+                <input type="number" data-role="bulk-count" inputmode="numeric" value="1">
+              </label>
+              <label>合計金額（円・本体のみ）
+                <input type="number" data-role="bulk-total" inputmode="numeric" value="0">
+              </label>
+              <label>品番の頭文字（任意）
+                <input data-role="bulk-prefix" placeholder="例：O">
+              </label>
+            </div>
+            <div class="actions">
+              <button class="btn small" type="button" data-action="bulk-add">この内容で行を追加</button>
+            </div>
           </div>
           <p><b data-role="purchase-total">本体 0円 ＋ 送料 0円 ＝ 仕入れ総額 0円</b></p>
           <div class="actions">
@@ -1598,6 +1619,31 @@
         && (!sups.length || sups.includes(pick.dataset.supplier));
       pick.hidden = !(hit || pick.querySelector('input').checked);
     });
+  }
+
+  // Adds one row per unit; the remainder of the split goes to the first row.
+  function addBulkRows(form) {
+    const category = form.querySelector('[data-role="bulk-category"]').value;
+    const count = Math.floor(numberOf(form.querySelector('[data-role="bulk-count"]').value));
+    const total = Math.trunc(numberOf(form.querySelector('[data-role="bulk-total"]').value));
+    const prefix = form.querySelector('[data-role="bulk-prefix"]').value.trim();
+    if (!category) throw new FormError('分類を選択してください');
+    if (total < 0) throw new FormError('合計金額は0以上で入力してください');
+    if (count < 1 || count > 50) throw new FormError('個数は1〜50で入力してください');
+    const body = form.querySelector('[data-role="rows-body"]');
+    const categories = JSON.parse(body.dataset.categories);
+    const start = body.querySelectorAll('[data-row]').length;
+    for (let k = 0; k < count; k += 1) body.insertAdjacentHTML('beforeend', purchaseRowHtml(categories));
+    const base = Math.floor(total / count);
+    [...body.querySelectorAll('[data-row]')].slice(start).forEach((row, k) => {
+      row.querySelector('[name="code"]').value = prefix ? `${prefix}-${k + 1}` : '';
+      row.querySelector('[name="category"]').value = category;
+      row.querySelector('[name="price"]').value = String(k === 0 ? total - base * (count - 1) : base);
+    });
+    form.querySelector('[data-role="bulk"]').hidden = true;
+    form.querySelector('[data-role="bulk-total"]').value = '0';
+    form.querySelector('[data-role="bulk-prefix"]').value = '';
+    allocateShipping(form);
   }
 
   function updateSaleFee(form) {
@@ -2690,6 +2736,17 @@
       row.querySelector('[data-role="shipping"]').dataset.manual = '0';
       allocateShipping(el.closest('form'));
     },
+    'toggle-bulk': (el) => {
+      const panel = el.closest('form').querySelector('[data-role="bulk"]');
+      panel.hidden = !panel.hidden;
+    },
+    'bulk-add': (el) => {
+      try {
+        addBulkRows(el.closest('form'));
+      } catch (err) {
+        reportError(err);
+      }
+    },
     'pick-filter': (el) => {
       const on = el.classList.toggle('active');
       el.setAttribute('aria-pressed', String(on));
@@ -2801,6 +2858,12 @@
     }
     if (el.name === 'item_ids' && el.form?.dataset.form === 'set') updateItemOrder(el.form, el);
     if (el.form?.dataset.form === 'sale' && el.name === 'channel') updateSaleFee(el.form);
+  });
+
+  main.addEventListener('keydown', (e) => {
+    if (e.key !== 'Enter' || e.target.tagName !== 'INPUT' || !e.target.closest('[data-role="bulk"]')) return;
+    e.preventDefault();
+    e.target.closest('form').querySelector('[data-action="bulk-add"]').click();
   });
 
   main.addEventListener('submit', async (e) => {

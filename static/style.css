@@ -328,6 +328,7 @@ img.cover { display: block; }
 .pick:has(input:checked) { border-color: var(--accent); background: #fbf1f2; }
 .pick[hidden] { display: none; }
 .pick-date { font-size: 0.7rem; color: var(--muted); }
+.bulk[hidden] { display: none; }
 button.tab { font: inherit; font-size: 0.9rem; cursor: pointer; }
 
 .group-head {
