@@ -774,6 +774,47 @@
     const urls = await photoUrls(rows.map((r) => r.thumb));
     const total = sum(rows.map((r) => r.cost));
     const all = !category && !supplier && !unset;
+    const purchaseById = new Map(st.purchases.map((p) => [p.id, p]));
+    const groups = [];
+    const groupByKey = new Map();
+    rows.forEach((r) => {
+      const key = purchaseById.has(r.purchase_id) ? r.purchase_id : `item:${r.id}`;
+      if (!groupByKey.has(key)) {
+        const group = { key, purchase: purchaseById.get(r.purchase_id) || null, rows: [] };
+        groupByKey.set(key, group);
+        groups.push(group);
+      }
+      groupByKey.get(key).rows.push(r);
+    });
+    const groupHtml = groups.map((g) => {
+      const members = g.purchase ? d.itemRows.filter((i) => i.purchase_id === g.key) : g.rows;
+      const received = members.filter((i) => i.received).length;
+      const attr = g.purchase ? `data-received-purchase="${g.key}"` : `data-received-id="${g.rows[0].id}"`;
+      const head = g.purchase
+        ? `<b>${esc(g.purchase.purchased_on)}</b> <span class="muted">${esc(g.purchase.supplier)} ／ ${members.length}点 ／ 原価合計 ${yen(sum(members.map((i) => i.cost)))}（送料合計 ${yen(g.purchase.shipping_total)}）${g.purchase.memo ? ` ／ ${esc(g.purchase.memo)}` : ''}</span>`
+        : `<b>${esc(g.rows[0].purchased_on)}</b> <span class="muted">${esc(g.rows[0].supplier)} ／ 伝票なし</span>`;
+      const partial = received > 0 && received < members.length ? '（一部受取済み）' : '';
+      const body = [...g.rows].sort((a, b) => a.seq - b.seq).map((r) => `
+              <tr>
+                <td>${urls.has(r.thumb) ? `<img class="thumb" src="${urls.get(r.thumb)}" alt="">` : ''}</td>
+                <td><a href="#/items/${r.id}">${esc(r.code)}</a></td>
+                <td>${esc(r.category)}</td>
+                <td class="num">${yen(r.cost)}</td>
+                <td>${r.set_id != null ? `<a href="#/sets/${r.set_id}">${esc(r.set_name)}</a>` : '<span class="muted">未所属</span>'}</td>
+              </tr>`).join('');
+      return `
+        <div class="card group">
+          <div class="group-head">
+            <label class="check"><input type="checkbox" ${attr} aria-label="この仕入れを受取済みにする"${received === members.length ? ' checked' : ''}> 受取済み${partial}</label>
+            <div>${head}</div>
+          </div>
+          <div class="table-wrap">
+            <table>
+              <tr><th>写真</th><th>品番</th><th>分類</th><th class="num">原価</th><th>セット</th></tr>${body}
+            </table>
+          </div>
+        </div>`;
+    }).join('') || '<p class="muted">該当する仕入れ品はありません</p>';
     return {
       title: '仕入れ品',
       html: `
@@ -790,22 +831,7 @@
           ${tabLink('#/items?unset=1', 'セット未所属のみ', unset)}
         </div>
         <p class="muted">${rows.length}件 ／ 原価合計 ${yen(total)}</p>
-        <div class="card table-wrap">
-          <table>
-            <tr><th>写真</th><th>品番</th><th>分類</th><th>仕入れ先</th><th>仕入れ日</th><th class="num">原価</th><th>セット</th><th>受取</th></tr>
-            ${rows.map((r) => `
-              <tr>
-                <td>${urls.has(r.thumb) ? `<img class="thumb" src="${urls.get(r.thumb)}" alt="">` : ''}</td>
-                <td><a href="#/items/${r.id}">${esc(r.code)}</a></td>
-                <td>${esc(r.category)}</td>
-                <td>${esc(r.supplier)}</td>
-                <td>${esc(r.purchased_on)}</td>
-                <td class="num">${yen(r.cost)}</td>
-                <td>${r.set_id != null ? `<a href="#/sets/${r.set_id}">${esc(r.set_name)}</a>` : '<span class="muted">未所属</span>'}</td>
-                <td><input type="checkbox" data-received-id="${r.id}" aria-label="受取済み"${r.received ? ' checked' : ''}></td>
-              </tr>`).join('') || '<tr><td colspan="8" class="muted">該当する仕入れ品はありません</td></tr>'}
-          </table>
-        </div>
+        ${groupHtml}
         ${await receiptSection(st, 'items')}`,
     };
   }
@@ -864,6 +890,7 @@
             <button class="btn sub small" type="button" data-action="add-row">+ 行を追加</button>
             <span class="muted" data-role="ship-sum"></span>
           </div>
+          <p><b data-role="purchase-total">本体 0円 ＋ 送料 0円 ＝ 仕入れ総額 0円</b></p>
           <div class="actions">
             <button class="btn" type="submit">仕入れを保存</button>
             <a class="btn sub" href="#/items">一覧へ戻る</a>
@@ -975,13 +1002,18 @@
     const members = new Set(set ? set.members.map((i) => i.id) : []);
     const orderIds = set ? [...set.members].sort(coverFirst(set.cover_item_id)).map((i) => i.id) : [];
     const picks = available.map((i) => `
-        <label class="pick" data-search="${esc([i.code, i.category, i.supplier, i.memo, i.purchased_on].join(' ').toLowerCase())}">
+        <label class="pick" data-category="${esc(i.category)}" data-supplier="${esc(i.supplier)}" data-search="${esc([i.code, i.category, i.supplier, i.memo, i.purchased_on].join(' ').toLowerCase())}">
           <input type="checkbox" name="item_ids" value="${i.id}"${members.has(i.id) ? ' checked' : ''}>
           ${urls.has(i.thumb) ? `<img src="${urls.get(i.thumb)}" alt="">` : '<span class="pick-none">写真なし</span>'}
           <b>${esc(i.code)}</b>
+          <span class="pick-date">${esc(i.purchased_on)}</span>
           <span class="muted">${esc(i.category)}・${yen(i.cost)}</span>
         </label>`).join('') || '<p class="muted">選べる仕入れ品がありません。先に仕入れを登録してください。</p>';
     const used = (kind) => set?.supplies.find((x) => x.kind === kind);
+    const chips = (group, label, values) => (values.length ? `
+            <div class="tabs"><span class="muted">${label}</span>${values.map((v) => `<button class="tab" type="button" data-action="pick-filter" data-group="${group}" data-value="${esc(v)}" aria-pressed="false">${esc(v)}</button>`).join('')}</div>` : '');
+    const chipHtml = chips('category', '分類', [...new Set(available.map((i) => i.category))])
+      + chips('supplier', '仕入れ先', [...new Set(available.map((i) => i.supplier))]);
     const supplyChecks = [
       `<label class="check"><input type="checkbox" name="supply" value="packaging"${set ? (used('packaging') ? ' checked' : '') : ' checked'}> 梱包材（一律 ${yen(packagingCostOf(st))}）</label>`,
       ...SUPPLY_KINDS.map(({ kind, name }) => {
@@ -1007,6 +1039,7 @@
           <div class="wide">
             <h2>構成品</h2>
             <p class="muted">写真をタップして選びます。最初に選んだ品の写真がセットの表示写真になります。</p>
+            ${chipHtml}
             <input type="search" data-role="pick-search" placeholder="品番・分類・仕入れ先・メモで検索" autocomplete="off">
             <div class="picks">${picks}</div>
           </div>
@@ -1548,13 +1581,21 @@
     const shown = sum(inputs.map((el) => numberOf(el.value)));
     const label = form.querySelector('[data-role="ship-sum"]');
     if (label) label.textContent = `送料の内訳合計 ${yen(shown)}（送料合計 ${yen(total)}）`;
+    const prices = sum([...form.querySelectorAll('[data-row] [name="price"]')].map((el) => numberOf(el.value)));
+    const grand = form.querySelector('[data-role="purchase-total"]');
+    if (grand) grand.textContent = `本体 ${yen(prices)} ＋ 送料 ${yen(shown)} ＝ 仕入れ総額 ${yen(prices + shown)}`;
   }
 
   // Selected items stay visible so the current picks are never hidden by a search.
-  function filterPicks(form, text) {
-    const words = text.toLowerCase().split(/\s+/).filter(Boolean);
+  function filterPicks(form) {
+    const words = (form.querySelector('[data-role="pick-search"]')?.value || '').toLowerCase().split(/\s+/).filter(Boolean);
+    const active = (group) => Array.from(form.querySelectorAll(`.tab.active[data-group="${group}"]`), (b) => b.dataset.value);
+    const cats = active('category');
+    const sups = active('supplier');
     form.querySelectorAll('.pick').forEach((pick) => {
-      const hit = words.every((w) => pick.dataset.search.includes(w));
+      const hit = words.every((w) => pick.dataset.search.includes(w))
+        && (!cats.length || cats.includes(pick.dataset.category))
+        && (!sups.length || sups.includes(pick.dataset.supplier));
       pick.hidden = !(hit || pick.querySelector('input').checked);
     });
   }
@@ -1802,6 +1843,16 @@
     if (!sale) return render();
     await dbTx(['sales'], 'readwrite', (s) => { s.sales.put({ ...sale, shipped }); });
     notify(shipped ? '発送済みにしました' : '発送済みを取り消しました');
+    render();
+  }
+
+  async function setReceivedPurchase(purchaseId, received) {
+    const st = await loadState();
+    const changed = st.items.filter((i) => i.purchase_id === purchaseId && Boolean(i.received) !== received);
+    if (changed.length) {
+      await dbTx(['items'], 'readwrite', (s) => { changed.forEach((i) => s.items.put({ ...i, received })); });
+    }
+    notify(received ? 'この仕入れを受取済みにしました' : '受取済みを取り消しました');
     render();
   }
 
@@ -2639,6 +2690,11 @@
       row.querySelector('[data-role="shipping"]').dataset.manual = '0';
       allocateShipping(el.closest('form'));
     },
+    'pick-filter': (el) => {
+      const on = el.classList.toggle('active');
+      el.setAttribute('aria-pressed', String(on));
+      filterPicks(el.closest('form'));
+    },
   };
 
   async function runAction(action, data) {
@@ -2715,8 +2771,10 @@
     if (form.dataset.form === 'purchase' && (el.dataset.role === 'shipping' || el.name === 'shipping_total')) {
       if (el.dataset.role === 'shipping') el.dataset.manual = '1';
       allocateShipping(form);
+    } else if (form.dataset.form === 'purchase' && el.name === 'price') {
+      allocateShipping(form);
     }
-    if (el.dataset.role === 'pick-search') filterPicks(form, el.value);
+    if (el.dataset.role === 'pick-search') filterPicks(form);
     if (form.dataset.form === 'sale') {
       if (el.dataset.role === 'fee') el.dataset.manual = '1';
       if (el.dataset.role === 'sale-price') updateSaleFee(form);
@@ -2731,6 +2789,10 @@
     }
     if (el.dataset?.shippedId) {
       setShipped(el.dataset.shippedId, el.checked);
+      return;
+    }
+    if (el.dataset?.receivedPurchase) {
+      setReceivedPurchase(el.dataset.receivedPurchase, el.checked);
       return;
     }
     if (el.dataset?.receivedId) {
