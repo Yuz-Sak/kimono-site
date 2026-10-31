@@ -844,9 +844,8 @@
         <td data-label="本体価格（円）"><input class="num-input" type="number" name="price" min="0" inputmode="numeric" value="0"></td>
         <td data-label="送料（円）"><input class="num-input" type="number" name="shipping" min="0" inputmode="numeric" value="0" data-role="shipping" data-manual="0"></td>
         <td data-label="メモ"><input name="memo"></td>
-        <td data-label="写真"><input type="file" name="photos" accept="image/*" multiple></td>
+        <td data-label="写真"><div class="photo-cell"><input type="file" name="photos" accept="image/*" multiple><div class="row-thumbs" data-role="photo-thumbs"></div></div></td>
         <td class="nowrap row-actions">
-          <button class="btn sub small" type="button" data-action="reset-shipping">送料を平均に戻す</button>
           <button class="btn danger small" type="button" data-action="remove-row">行を削除</button>
         </td>
       </tr>`;
@@ -889,6 +888,7 @@
           <div class="actions">
             <button class="btn sub small" type="button" data-action="add-row">+ 行を追加</button>
             <button class="btn sub small" type="button" data-action="toggle-bulk">まとめ買い</button>
+            <button class="btn sub small" type="button" data-action="reset-shipping">送料を平均に戻す</button>
             <span class="muted" data-role="ship-sum"></span>
           </div>
           <div class="card bulk" data-role="bulk" hidden>
@@ -1644,6 +1644,19 @@
     form.querySelector('[data-role="bulk-total"]').value = '0';
     form.querySelector('[data-role="bulk-prefix"]').value = '';
     allocateShipping(form);
+  }
+
+  function showPhotoThumbs(input) {
+    const box = input.closest('.photo-cell').querySelector('[data-role="photo-thumbs"]');
+    box.replaceChildren(...Array.from(input.files, (file) => {
+      const url = URL.createObjectURL(file);
+      objectUrls.push(url); // released by revokeUrls() on the next render
+      const img = document.createElement('img');
+      img.className = 'row-thumb';
+      img.alt = '';
+      img.src = url;
+      return img;
+    }));
   }
 
   function updateSaleFee(form) {
@@ -2757,9 +2770,9 @@
       allocateShipping(form);
     },
     'reset-shipping': (el) => {
-      const row = el.closest('tr');
-      row.querySelector('[data-role="shipping"]').dataset.manual = '0';
-      allocateShipping(el.closest('form'));
+      const form = el.closest('form');
+      form.querySelectorAll('[data-role="shipping"]').forEach((input) => { input.dataset.manual = '0'; });
+      allocateShipping(form);
     },
     'toggle-bulk': (el) => {
       const panel = el.closest('form').querySelector('[data-role="bulk"]');
@@ -2868,6 +2881,10 @@
     const el = e.target;
     if (el.dataset?.nav) {
       go(el.dataset.nav + encodeURIComponent(el.value));
+      return;
+    }
+    if (el.form?.dataset.form === 'purchase' && el.name === 'photos') {
+      showPhotoThumbs(el);
       return;
     }
     if (el.dataset?.shippedId) {
