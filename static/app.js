@@ -2428,8 +2428,7 @@
   }
 
   async function enqueuePhotoBackfill() {
-    const cfg = loadSync();
-    if (cfg.role !== 'owner' || cfg.photoBackfillDone) return;
+    if (loadSync().photoBackfillDone) return;
     const files = await dbTx(['photos', 'photo_files'], 'readonly', (s) => ({
       photos: s.photos.getAll(),
       fileKeys: s.photo_files.getAllKeys(),
@@ -2547,23 +2546,40 @@
     }
   }
 
-  // Owner: uploads this device's data when the server is empty.
-  // Worker: replaces this device's data with the server data. The seed masters are discarded.
+  // Runs once per connection. Empty server: this device's data is uploaded.
+  // Server has data and this device only has the seed masters: the server data is adopted.
+  // Both have data: sync stops until the user picks one with the replace operation.
   async function initialSync() {
-    const { role } = loadSync();
     const remote = await restRequest('records?select=store&limit=1');
-    if (role === 'worker') {
-      if (!remote.length) throw new SyncError('サーバーにデータがありません。先にオーナーの端末で同期してください');
-      if ((await readOutbox()).length) throw new SyncError('未送信の変更があるため、この端末のデータを置き換えられません');
-      await dbTx(STORE_NAMES, 'readwrite', (s) => {
-        STORE_NAMES.forEach((name) => { s[name].clear(); });
-      });
-      saveSync({ cursor: null, initialDone: true });
+    if (!remote.length) {
+      await enqueueAll();
+      saveSync({ initialDone: true });
       return;
     }
-    if (remote.length) throw new SyncError('サーバーにデータがあります。作業者として接続するか、サーバーの内容を確認してください');
-    await enqueueAll();
-    saveSync({ initialDone: true });
+    if (!(await isFreshDevice())) {
+      throw new SyncError('この端末とサーバーの両方にデータがあるため、同期を止めています。設定の「サーバーの内容でこの端末を置き換える」で、残すデータを選んでください');
+    }
+    await adoptServerData();
+  }
+
+  // True when this device has no user data and no unsent changes. The seed masters do not count.
+  async function isFreshDevice() {
+    if ((await readOutbox()).length) return false;
+    const st = await loadState();
+    if (DATA_KEYS.some((k) => k !== 'masters' && st[k].length > 0)) return false;
+    return st.masters.length === SEEDS.length
+      && st.masters.every((m) => SEEDS.some((seed) => seed.kind === m.kind && seed.name === m.name && seed.fee_rate === m.fee_rate));
+  }
+
+  // Replaces this device's data and unsent changes with the server data.
+  async function adoptServerData() {
+    const remote = await restRequest('records?select=store&limit=1');
+    if (!remote.length) throw new SyncError('サーバーにデータがないため、置き換えできません');
+    await dbTx(STORE_NAMES, 'readwrite', (s) => {
+      STORE_NAMES.forEach((name) => { s[name].clear(); });
+      s.outbox.clear();
+    });
+    saveSync({ cursor: null, initialDone: true, photoBackfillDone: true });
   }
 
   async function runSync() {
@@ -2629,10 +2645,12 @@
 
   function syncSection() {
     const cfg = loadSync();
-    const role = cfg.role === 'worker' ? 'worker' : 'owner';
     const login = cfg.refreshToken
       ? `<p>ログイン中：${esc(cfg.email || '')}</p>
-         <div class="actions"><button class="btn sub small" type="button" data-action="sync-logout">ログアウト</button></div>`
+         <div class="actions"><button class="btn sub small" type="button" data-action="sync-logout">ログアウト</button></div>
+         <h3>データの置き換え</h3>
+         <p class="muted">この端末のデータと未送信の変更を消して、サーバーの内容を受け取ります。両方にデータがあり同期が止まったときに使います。消す前にバックアップを保存してください。</p>
+         <div class="actions"><button class="btn danger small" type="button" data-action="sync-adopt" data-confirm="この端末のデータと未送信の変更は消えます。よろしいですか？">サーバーの内容でこの端末を置き換える</button></div>`
       : `<form class="grid" data-form="sync-login">
            <label>メールアドレス
              <input type="email" name="email" autocomplete="username">
@@ -2652,12 +2670,9 @@
           <label class="wide">公開キー
             <input name="key" value="${esc(cfg.key || '')}" autocomplete="off">
           </label>
-          <label>この端末の役割
-            <select name="role">${opt('owner', 'オーナー', role === 'owner')}${opt('worker', '作業者', role === 'worker')}</select>
-          </label>
           <div class="wide actions"><button class="btn small" type="submit">接続情報を保存</button></div>
         </form>
-        <p class="muted">オーナーは、この端末のデータを最初にすべてサーバーへ送ります。作業者は、初回にこの端末のデータをサーバーの内容で置き換えます。接続情報はこの端末だけに保存され、バックアップには含まれません。</p>
+        <p class="muted">接続情報を保存してログインすると、自動で同期します。サーバーが空なら、この端末のデータを送ります。サーバーにデータがあり、この端末が初期データだけなら、サーバーの内容を受け取ります。両方にデータがある場合は同期を止めるので、下の「置き換え」で残すほうを選びます。接続情報はこの端末だけに保存され、バックアップには含まれません。</p>
       </div>
       <div class="card">${login}</div>`;
   }
@@ -2665,15 +2680,12 @@
   async function saveSyncConfig(form) {
     const url = fieldText(form, 'url').replace(/\/+$/, '');
     const key = fieldText(form, 'key');
-    const role = fieldChoice(form, 'role', ['owner', 'worker']);
     if (!isAllowedUrl(url)) throw new FormError('Project URL は https:// で始まるアドレスを入力してください');
     if (!key) throw new FormError('公開キーを入力してください');
     const old = loadSync();
-    if (old.url === url && old.key === key) {
-      saveSync({ role });
-    } else {
+    if (old.url !== url || old.key !== key) {
       forgetSession();
-      saveSync({ url, key, role, refreshToken: null, email: null, cursor: null, initialDone: false });
+      saveSync({ url, key, refreshToken: null, email: null, cursor: null, initialDone: false });
     }
     notify('接続情報を保存しました');
     requestSync();
@@ -2696,6 +2708,19 @@
     forgetSession();
     saveSync({ refreshToken: null, email: null });
     notify('ログアウトしました');
+    requestSync();
+    return render();
+  }
+
+  async function replaceWithServer() {
+    if (syncRunning) throw new SyncError('同期中です。少し待ってからもう一度お試しください');
+    syncRunning = true;
+    try {
+      await adoptServerData();
+    } finally {
+      syncRunning = false;
+    }
+    notify('サーバーの内容に置き換えました');
     requestSync();
     return render();
   }
@@ -2769,6 +2794,7 @@
       case 'csv': return exportCsv(data.kind);
       case 'backup': return downloadBackup();
       case 'sync-logout': return logoutSync();
+      case 'sync-adopt': return replaceWithServer();
       case 'delete-receipt': return deleteReceipt(data.id);
       default: return undefined;
     }
