@@ -20,8 +20,9 @@
     outbox: { keyPath: ['store', 'id'] },
   };
   const SUPPLY_KINDS = [
-    { kind: 'obiage', name: '帯揚げ' },
-    { kind: 'obijime', name: '帯締め' },
+    { kind: 'obiage', name: '帯揚げ', defaultInSet: true },
+    { kind: 'obijime', name: '帯締め', defaultInSet: true },
+    { kind: 'teiobi', name: '定価帯', defaultInSet: false },
   ];
   const DEFAULT_PACKAGING_COST = 150;
   const SEEDS = [
@@ -510,9 +511,10 @@
     if (head === undefined) return { view: viewHome };
     if (head === 'items') {
       if (arg === undefined) return { view: viewItems };
-      if (arg === 'new') return { view: viewPurchaseForm };
+      if (arg === 'new') return { view: viewPurchaseForm, id: null };
       return { view: viewItemForm, id: arg };
     }
+    if (head === 'purchases' && arg) return { view: viewPurchaseForm, id: arg };
     if (head === 'stock') return { view: viewStock };
     if (head === 'supplies') return { view: viewSupplies };
     if (head === 'sets') {
@@ -801,16 +803,18 @@
                 <td>${esc(r.category)}</td>
                 <td class="num">${yen(r.cost)}</td>
                 <td>${r.set_id != null ? `<a href="#/sets/${r.set_id}">${esc(r.set_name)}</a>` : '<span class="muted">未所属</span>'}</td>
+                ${g.purchase ? `<td><label class="check"><input type="checkbox" data-received-item="${r.id}"${r.received ? ' checked' : ''}> 受取</label></td>` : ''}
               </tr>`).join('');
       return `
         <div class="card group">
           <div class="group-head">
             <label class="check"><input type="checkbox" ${attr} aria-label="この仕入れを受取済みにする"${received === members.length ? ' checked' : ''}> 受取済み${partial}</label>
             <div>${head}</div>
+            ${g.purchase ? `<a class="btn sub small" href="#/purchases/${g.key}">伝票を編集</a>` : ''}
           </div>
           <div class="table-wrap">
             <table>
-              <tr><th>写真</th><th>品番</th><th>分類</th><th class="num">原価</th><th>セット</th></tr>${body}
+              <tr><th>写真</th><th>品番</th><th>分類</th><th class="num">原価</th><th>セット</th>${g.purchase ? '<th>受取</th>' : ''}</tr>${body}
             </table>
           </div>
         </div>`;
@@ -836,41 +840,55 @@
     };
   }
 
-  function purchaseRowHtml(categories) {
+  // item: an existing 仕入れ品 when editing a 伝票. Its stored shipping is kept as a manual value.
+  function purchaseRowHtml(categories, item = null, photoCount = 0) {
     return `
       <tr data-row>
-        <td data-label="品番"><input name="code" placeholder="例：KJ-001"></td>
-        <td data-label="分類"><select name="category">${selectOptions(categories, '')}</select></td>
-        <td data-label="本体価格（円）"><input class="num-input" type="number" name="price" min="0" inputmode="numeric" value="0"></td>
-        <td data-label="送料（円）"><input class="num-input" type="number" name="shipping" min="0" inputmode="numeric" value="0" data-role="shipping" data-manual="0"></td>
-        <td data-label="メモ"><input name="memo"></td>
-        <td data-label="写真"><div class="photo-cell"><input type="file" name="photos" accept="image/*" multiple><div class="row-thumbs" data-role="photo-thumbs"></div></div></td>
+        <td data-label="品番"><input type="hidden" name="item_id" value="${esc(item?.id)}"><input name="code" placeholder="例：KJ-001" value="${esc(item?.code)}"></td>
+        <td data-label="分類"><select name="category">${selectOptions(categories, item?.category ?? '')}</select></td>
+        <td data-label="本体価格（円）"><input class="num-input" type="number" name="price" min="0" inputmode="numeric" value="${item ? item.price : 0}"></td>
+        <td data-label="送料（円）"><input class="num-input" type="number" name="shipping" min="0" inputmode="numeric" value="${item ? item.shipping : 0}" data-role="shipping" data-manual="${item ? '1' : '0'}"></td>
+        <td data-label="メモ"><input name="memo" value="${esc(item?.memo)}"></td>
+        <td data-label="写真"><div class="photo-cell"><input type="file" name="photos" accept="image/*" multiple>${photoCount ? `<span class="muted">登録済み${photoCount}枚</span>` : ''}<div class="row-thumbs" data-role="photo-thumbs"></div></div></td>
         <td class="nowrap row-actions">
           <button class="btn danger small" type="button" data-action="remove-row">行を削除</button>
         </td>
       </tr>`;
   }
 
-  function viewPurchaseForm({ st }) {
+  // Without id: new 伝票. With id: edit an existing 伝票 and its 仕入れ品.
+  async function viewPurchaseForm({ st, d, id }) {
     const categories = namesOf(st, 'category');
     const suppliers = namesOf(st, 'supplier');
+    const purchase = id ? st.purchases.find((p) => p.id === id) : null;
+    if (id && !purchase) return notFound();
+    const items = purchase
+      ? st.items.filter((i) => i.purchase_id === purchase.id).sort((a, b) => a.seq - b.seq)
+      : [];
+    const rowsHtml = items.length
+      ? items.map((item) => purchaseRowHtml(categories, item, d.itemPhotos.get(item.id)?.length ?? 0)).join('')
+      : purchaseRowHtml(categories);
+    const prices = sum(items.map((i) => i.price));
+    const shippedSum = sum(items.map((i) => i.shipping));
+    const shipLabel = purchase ? `送料の内訳合計 ${yen(shippedSum)}（送料合計 ${yen(purchase.shipping_total)}）` : '';
+    const totalText = `本体 ${yen(prices)} ＋ 送料 ${yen(shippedSum)} ＝ 仕入れ総額 ${yen(prices + shippedSum)}`;
     return {
-      title: '仕入れを登録',
+      title: purchase ? '仕入れの編集' : '仕入れを登録',
       html: `
-        <h1>仕入れを登録</h1>
-        <form class="card" data-form="purchase">
+        <h1>${purchase ? '仕入れの編集' : '仕入れを登録'}</h1>
+        <form class="card" data-form="purchase"${purchase ? ` data-id="${purchase.id}"` : ''}>
           <div class="grid">
             <label>仕入れ日
-              <input type="date" name="purchased_on" value="${today()}">
+              <input type="date" name="purchased_on" value="${purchase ? esc(purchase.purchased_on) : today()}">
             </label>
             <label>仕入れ先
-              <select name="supplier">${selectOptions(suppliers, '')}</select>
+              <select name="supplier">${selectOptions(suppliers, purchase?.supplier ?? '')}</select>
             </label>
             <label>送料合計（伝票全体・円）
-              <input type="number" name="shipping_total" min="0" inputmode="numeric" value="0">
+              <input type="number" name="shipping_total" min="0" inputmode="numeric" value="${purchase ? purchase.shipping_total : 0}">
             </label>
             <label>メモ
-              <input name="memo">
+              <input name="memo" value="${esc(purchase?.memo)}">
             </label>
           </div>
           <h2>仕入れ品</h2>
@@ -881,7 +899,7 @@
                 <tr><th>品番</th><th>分類</th><th class="num">本体価格（円）</th><th class="num">送料（円）</th><th>メモ</th><th>写真</th><th></th></tr>
               </thead>
               <tbody data-role="rows-body" data-categories="${esc(JSON.stringify(categories))}">
-                ${purchaseRowHtml(categories)}
+                ${rowsHtml}
               </tbody>
             </table>
           </div>
@@ -889,7 +907,7 @@
             <button class="btn sub small" type="button" data-action="add-row">+ 行を追加</button>
             <button class="btn sub small" type="button" data-action="toggle-bulk">まとめ買い</button>
             <button class="btn sub small" type="button" data-action="reset-shipping">送料を平均に戻す</button>
-            <span class="muted" data-role="ship-sum"></span>
+            <span class="muted" data-role="ship-sum">${shipLabel}</span>
           </div>
           <div class="card bulk" data-role="bulk" hidden>
             <p class="muted">まとめて買った品の合計金額を個数で割り、1点ずつの行を作ります。</p>
@@ -911,9 +929,9 @@
               <button class="btn small" type="button" data-action="bulk-add">この内容で行を追加</button>
             </div>
           </div>
-          <p><b data-role="purchase-total">本体 0円 ＋ 送料 0円 ＝ 仕入れ総額 0円</b></p>
+          <p><b data-role="purchase-total">${totalText}</b></p>
           <div class="actions">
-            <button class="btn" type="submit">仕入れを保存</button>
+            <button class="btn" type="submit">${purchase ? '保存' : '仕入れを保存'}</button>
             <a class="btn sub" href="#/items">一覧へ戻る</a>
           </div>
         </form>`,
@@ -1037,10 +1055,10 @@
       + chips('supplier', '仕入れ先', [...new Set(available.map((i) => i.supplier))]);
     const supplyChecks = [
       `<label class="check"><input type="checkbox" name="supply" value="packaging"${set ? (used('packaging') ? ' checked' : '') : ' checked'}> 梱包材（一律 ${yen(packagingCostOf(st))}）</label>`,
-      ...SUPPLY_KINDS.map(({ kind, name }) => {
+      ...SUPPLY_KINDS.map(({ kind, name, defaultInSet }) => {
         const stock = d.supplyStock[kind];
         const canUse = Boolean(used(kind)) || stock.left >= 1;
-        const checked = Boolean(used(kind)) || !set;
+        const checked = Boolean(used(kind)) || (!set && defaultInSet);
         const disabled = set && !canUse;
         return `<label class="check"><input type="checkbox" name="supply" value="${kind}"${checked ? ' checked' : ''}${disabled ? ' disabled' : ''}> ${name}（平均 ${yen(stock.unit)} × 1本・在庫 ${stock.left}本${canUse ? '' : ' ／ 在庫なし'}）</label>`;
       }),
@@ -1233,7 +1251,7 @@
       title: '備品',
       html: `
         <h1>備品</h1>
-        <p class="muted">帯締め・帯揚げは数と総額で登録し、平均単価でセットの原価に入れます。梱包材は設定の単価を、セットごとに原価に入れます。</p>
+        <p class="muted">帯締め・帯揚げ・定価帯は数と総額で登録し、平均単価でセットの原価に入れます。梱包材は設定の単価を、セットごとに原価に入れます。</p>
         <div class="card table-wrap">
           <table>
             <tr><th>備品</th><th class="num">購入数</th><th class="num">使用数</th><th class="num">在庫数</th><th class="num">平均単価</th><th class="num">在庫の金額</th></tr>
@@ -1670,35 +1688,57 @@
 
   async function savePurchase(form) {
     const st = await loadState();
+    const purchaseId = form.dataset.id || null;
+    const existing = purchaseId ? st.purchases.find((p) => p.id === purchaseId) : null;
+    if (purchaseId && !existing) throw new FormError('仕入れが見つかりません');
     const purchasedOn = fieldDate(form, 'purchased_on');
     const supplier = fieldChoice(form, 'supplier', namesOf(st, 'supplier'));
     const shippingTotal = fieldInt(form, 'shipping_total');
     const memo = fieldText(form, 'memo');
-    const rows = Array.from(form.querySelectorAll('[data-row]'), (row) => ({
-      code: row.querySelector('[name="code"]').value.trim(),
-      category: row.querySelector('[name="category"]').value,
-      price: parseYen(row.querySelector('[name="price"]').value),
-      shipping: parseYen(row.querySelector('[name="shipping"]').value),
-      memo: row.querySelector('[name="memo"]').value.trim(),
-      files: row.querySelector('[name="photos"]').files,
-      id: newId(),
-    })).filter((r) => r.code || r.price || r.shipping || r.memo || r.files.length);
+    const rows = Array.from(form.querySelectorAll('[data-row]'), (row) => {
+      const itemId = row.querySelector('[name="item_id"]').value || null;
+      return {
+        itemId,
+        id: itemId ?? newId(),
+        code: row.querySelector('[name="code"]').value.trim(),
+        category: row.querySelector('[name="category"]').value,
+        price: parseYen(row.querySelector('[name="price"]').value),
+        shipping: parseYen(row.querySelector('[name="shipping"]').value),
+        memo: row.querySelector('[name="memo"]').value.trim(),
+        files: row.querySelector('[name="photos"]').files,
+      };
+    }).filter((r) => r.itemId || r.code || r.price || r.shipping || r.memo || r.files.length);
     if (!rows.length) throw new FormError('仕入れ品を1点以上入力してください');
     if (rows.some((r) => !r.code)) throw new FormError('品番を入力してください');
     if (sum(rows.map((r) => r.shipping)) !== shippingTotal) {
       throw new FormError('送料の内訳合計が送料合計と一致しません。送料を確認してください');
     }
 
-    const purchaseId = newId();
-    await dbTx(['purchases'], 'readwrite', (s) => {
-      s.purchases.add({ id: purchaseId, seq: nextSeq(), purchased_on: purchasedOn, supplier, shipping_total: shippingTotal, memo });
-    });
-    await dbTx(['items'], 'readwrite', (s) => {
+    const id = existing?.id ?? newId();
+    const old = st.items.filter((i) => i.purchase_id === id);
+    const oldById = new Map(old.map((i) => [i.id, i]));
+    const kept = new Set(rows.map((r) => r.itemId).filter(Boolean));
+    const removed = old.filter((i) => !kept.has(i.id));
+    if (removed.some((i) => i.set_id != null)) {
+      throw new FormError('販売セットに入っている品は削除できません。先にセットから外してください');
+    }
+    const removedIds = new Set(removed.map((i) => i.id));
+    const photoIds = st.photos.filter((p) => removedIds.has(p.item_id)).map((p) => p.id);
+
+    await dbTx(['purchases', 'items', 'photos', 'photo_files'], 'readwrite', (s) => {
+      s.purchases.put({
+        id,
+        seq: existing?.seq ?? nextSeq(),
+        purchased_on: purchasedOn,
+        supplier,
+        shipping_total: shippingTotal,
+        memo,
+      });
       rows.forEach((r) => {
-        s.items.add({
-          id: r.id,
-          seq: nextSeq(),
-          purchase_id: purchaseId,
+        const base = r.itemId ? oldById.get(r.itemId) : { id: r.id, seq: nextSeq(), set_id: null, received: false };
+        s.items.put({
+          ...base,
+          purchase_id: id,
           code: r.code,
           category: r.category,
           supplier,
@@ -1706,13 +1746,16 @@
           price: r.price,
           shipping: r.shipping,
           memo: r.memo,
-          set_id: null,
-          received: false,
         });
+      });
+      removed.forEach((i) => s.items.delete(i.id));
+      photoIds.forEach((pid) => {
+        s.photos.delete(pid);
+        s.photo_files.delete(pid);
       });
     });
     for (const r of rows) await addPhotos(r.files, { item_id: r.id, set_id: null });
-    notify(`仕入れを登録しました（${rows.length}点）`);
+    notify(existing ? `仕入れを更新しました（${rows.length}点）` : `仕入れを登録しました（${rows.length}点）`);
     go('#/items');
   }
 
@@ -2766,7 +2809,9 @@
     },
     'remove-row': (el) => {
       const form = el.closest('form');
-      el.closest('tr').remove();
+      const row = el.closest('tr');
+      if (row.querySelector('[name="item_id"]').value && !confirm('この仕入れ品は保存時に削除されます。よろしいですか？')) return;
+      row.remove();
       allocateShipping(form);
     },
     'reset-shipping': (el) => {
@@ -2893,6 +2938,10 @@
     }
     if (el.dataset?.receivedPurchase) {
       setReceivedPurchase(el.dataset.receivedPurchase, el.checked);
+      return;
+    }
+    if (el.dataset?.receivedItem) {
+      setReceived(el.dataset.receivedItem, el.checked);
       return;
     }
     if (el.dataset?.receivedId) {
