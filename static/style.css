@@ -352,7 +352,17 @@ button.tab { font: inherit; font-size: 0.9rem; cursor: pointer; }
   margin-bottom: 8px;
 }
 .group-head .check { padding: 0; font-weight: 600; }
-.pick:has(input:disabled) { opacity: 0.5; cursor: not-allowed; }
+.pick.is-taken { border-style: dashed; background: #f7f5f3; cursor: pointer; }
+.pick.is-taken img,
+.pick.is-taken .pick-none { opacity: 0.45; }
+.pick-taken { font-size: 0.75rem; font-weight: 600; color: var(--accent); }
+.taken-info { margin: 8px 0; }
+.taken-info[hidden] { display: none; }
+.taken-info p { margin: 0 0 6px; }
+.taken-members { display: flex; flex-wrap: wrap; gap: 8px; margin: 8px 0; }
+.taken-member { display: flex; flex-direction: column; align-items: center; gap: 2px; width: 64px; font-size: 0.8rem; }
+.taken-member img,
+.taken-member .pick-none { width: 56px; border-radius: 4px; }
 
 /* Report dashboard */
 .dash h3 { margin: 0 0 10px; font-size: 1rem; }

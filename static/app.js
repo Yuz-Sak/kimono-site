@@ -1036,18 +1036,42 @@
       };
     }
     const photos = set ? d.setPhotos.get(set.id) || [] : [];
-    const available = d.itemRows.filter((i) => i.set_id == null || (set && i.set_id === set.id));
+    const available = d.itemRows;
     const urls = await photoUrls([...photos.map((p) => p.id), ...available.map((i) => i.thumb)]);
     const members = new Set(set ? set.members.map((i) => i.id) : []);
     const orderIds = set ? [...set.members].sort(coverFirst(set.cover_item_id)).map((i) => i.id) : [];
-    const picks = available.map((i) => `
+    // Items in another set cannot be picked here; tapping one shows the set it belongs to.
+    const isTaken = (i) => i.set_id != null && i.set_id !== set?.id;
+    const setRowById = new Map(d.setRows.map((s) => [s.id, s]));
+    const takenOwners = [...new Set(available.filter(isTaken).map((i) => i.set_id))];
+    const pickImg = (i) => (urls.has(i.thumb) ? `<img src="${urls.get(i.thumb)}" alt="">` : '<span class="pick-none">写真なし</span>');
+    const picks = available.map((i) => (isTaken(i) ? `
+        <label class="pick is-taken" data-action="show-taken" data-set-id="${i.set_id}" data-code="${esc(i.code)}" data-category="${esc(i.category)}" data-supplier="${esc(i.supplier)}" data-search="${esc([i.code, i.category, i.supplier, i.memo, i.purchased_on].join(' ').toLowerCase())}">
+          <input type="checkbox" name="item_ids" value="${i.id}" disabled>
+          ${pickImg(i)}
+          <b>${esc(i.code)}</b>
+          <span class="pick-date">${esc(i.purchased_on)}</span>
+          <span class="pick-taken">「${esc(setRowById.get(i.set_id)?.name ?? '不明なセット')}」に登録済み</span>
+        </label>` : `
         <label class="pick" data-category="${esc(i.category)}" data-supplier="${esc(i.supplier)}" data-search="${esc([i.code, i.category, i.supplier, i.memo, i.purchased_on].join(' ').toLowerCase())}">
           <input type="checkbox" name="item_ids" value="${i.id}"${members.has(i.id) ? ' checked' : ''}>
-          ${urls.has(i.thumb) ? `<img src="${urls.get(i.thumb)}" alt="">` : '<span class="pick-none">写真なし</span>'}
+          ${pickImg(i)}
           <b>${esc(i.code)}</b>
           <span class="pick-date">${esc(i.purchased_on)}</span>
           <span class="muted">${esc(i.category)}・${yen(i.cost)}</span>
-        </label>`).join('') || '<p class="muted">選べる仕入れ品がありません。先に仕入れを登録してください。</p>';
+        </label>`)).join('') || '<p class="muted">選べる仕入れ品がありません。先に仕入れを登録してください。</p>';
+    const takenPanels = takenOwners.map((sid) => {
+      const owner = setRowById.get(sid);
+      const ownerName = esc(owner?.name ?? '不明なセット');
+      const ownerItems = available.filter((i) => i.set_id === sid);
+      return `
+      <div class="card taken-info" data-taken-set="${sid}" hidden>
+        <p><b data-role="taken-code"></b> は「${ownerName}」に入っているため、このセットでは選べません。</p>
+        <p class="muted">「${ownerName}」：${esc(owner?.display_status ?? '')}・${ownerItems.length}点</p>
+        <div class="taken-members">${ownerItems.map((i) => `<span class="taken-member">${pickImg(i)}<b>${esc(i.code)}</b></span>`).join('')}</div>
+        <button class="btn sub small" type="button" data-action="close-taken">閉じる</button>
+      </div>`;
+    }).join('');
     const used = (kind) => set?.supplies.find((x) => x.kind === kind);
     const chips = (group, label, values) => (values.length ? `
             <div class="tabs"><span class="muted">${label}</span>${values.map((v) => `<button class="tab" type="button" data-action="pick-filter" data-group="${group}" data-value="${esc(v)}" aria-pressed="false">${esc(v)}</button>`).join('')}</div>` : '');
@@ -1078,8 +1102,10 @@
           <div class="wide">
             <h2>構成品</h2>
             <p class="muted">写真をタップして選びます。最初に選んだ品の写真がセットの表示写真になります。</p>
+            ${takenOwners.length ? '<p class="muted">淡く表示された品は別のセットに入っているため選べません。タップすると、入っているセットの構成品を確認できます。</p>' : ''}
             ${chipHtml}
             <input type="search" data-role="pick-search" placeholder="品番・分類・仕入れ先・メモで検索" autocomplete="off">
+            ${takenPanels}
             <div class="picks">${picks}</div>
           </div>
           <input type="hidden" name="item_order" value="${orderIds.join(',')}">
@@ -1428,15 +1454,22 @@
       ${period.profit < 0 ? '<p class="muted">赤字の期間は利益を0円として表示しています。</p>' : ''}`;
   }
 
-  async function viewReport({ st, query }) {
+  async function viewReport({ st, d, query }) {
     const currentYear = new Date().getFullYear();
     const yearRaw = query.get('year') ?? String(currentYear);
     const year = yearRaw === 'all' ? null : Number(yearRaw) || currentYear;
-    const monthRaw = query.get('month') ?? String(new Date().getMonth() + 1);
+    const monthRaw = query.get('month') ?? '0';
     const month = year === null ? 0 : Math.min(12, Math.max(0, Number(monthRaw) || 0));
     let prefix = '';
     if (year !== null) prefix = month ? `${year}-${pad2(month)}` : `${year}-`;
     const period = ledger(st, (date) => date.startsWith(prefix));
+    const soldDays = d.setRows
+      .filter((s) => s.sold && s.listed_on && s.sale.sold_on.startsWith(prefix))
+      .map((s) => (Date.parse(s.sale.sold_on) - Date.parse(s.listed_on)) / 86400000);
+    const avgDays = soldDays.length ? sum(soldDays) / soldDays.length : null;
+    const listedSetIds = new Set(d.setRows.filter((s) => s.display_status !== '出品前').map((s) => s.id));
+    const purchased = d.itemRows.filter((i) => i.purchased_on.startsWith(prefix));
+    const listRate = purchased.length ? purchased.filter((i) => listedSetIds.has(i.set_id)).length / purchased.length : null;
     let label = '全期間';
     if (year !== null) label = month ? `${year}年${month}月` : `${year}年（年間）`;
     const rows = monthlyRows(st, year);
@@ -1469,9 +1502,11 @@
           ${kpi('仕入れ', yen(period.purchase))}
           ${kpi('経費', yen(period.expense))}
           ${kpi('手数料・発送料', yen(period.sales_cost))}
+          ${kpi('平均販売日数', avgDays == null ? '-' : `${avgDays.toFixed(1)}日`)}
+          ${kpi('出品率', pct(listRate))}
         </div>
         <h2>月別の内訳</h2>
-        <p class="muted">売上は販売日、仕入れは仕入れ日、経費は支出日で集計しています。利益率は利益÷売上です。</p>
+        <p class="muted">売上は販売日、仕入れは仕入れ日、経費は支出日で集計しています。利益率は利益÷売上です。平均販売日数は出品日から販売日までの平均、出品率は期間中に仕入れた品のうち出品済みの割合です。</p>
         <div class="card table-wrap">
           <table>
             <tr>
@@ -2834,6 +2869,16 @@
       const on = el.classList.toggle('active');
       el.setAttribute('aria-pressed', String(on));
       filterPicks(el.closest('form'));
+    },
+    'show-taken': (el) => {
+      const form = el.closest('form');
+      const panel = form.querySelector(`[data-taken-set="${el.dataset.setId}"]`);
+      form.querySelectorAll('[data-taken-set]').forEach((p) => { p.hidden = p !== panel; });
+      panel.querySelector('[data-role="taken-code"]').textContent = el.dataset.code;
+      panel.scrollIntoView({ block: 'nearest' });
+    },
+    'close-taken': (el) => {
+      el.closest('[data-taken-set]').hidden = true;
     },
   };
 
