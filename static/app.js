@@ -22,7 +22,7 @@
   const SUPPLY_KINDS = [
     { kind: 'obiage', name: '帯揚げ', defaultInSet: true },
     { kind: 'obijime', name: '帯締め', defaultInSet: true },
-    { kind: 'teiobi', name: '定価帯', defaultInSet: false },
+    { kind: 'teiobi', name: '備品帯', defaultInSet: false },
   ];
   const DEFAULT_PACKAGING_COST = 150;
   const SEEDS = [
@@ -335,6 +335,7 @@
       const supplies = s.supplies || [];
       const cost = sum(members.map(itemCost)) + sum(supplies.map((x) => x.unit_cost * x.qty));
       const sold = sale !== null;
+      const disposed = Boolean(s.disposed_on);
       const revenue = sold ? sale.sale_price : 0;
       const fees = sold ? sale.platform_fee + sale.shipping_cost : 0;
       const gallery = [
@@ -345,6 +346,7 @@
         ...s,
         sale,
         sold,
+        disposed,
         members,
         supplies,
         cost,
@@ -353,13 +355,13 @@
         profit: sold ? revenue - fees - cost : null,
         item_count: members.length,
         item_names: members.map((i) => i.code).join(' / '),
-        display_status: sold ? '売却済み' : s.status,
+        display_status: sold ? '売却済み' : disposed ? '廃棄済み' : s.status,
         gallery,
         thumb: gallery[0]?.id ?? null,
       };
     }).sort((a, b) => b.seq - a.seq);
 
-    const unsoldSets = setRows.filter((s) => !s.sold);
+    const unsoldSets = setRows.filter((s) => !s.sold && !s.disposed);
     const unassignedItems = itemRows.filter((i) => i.set_id == null);
 
     // 備品 stock = purchased count - count used by sets. Unit cost is the cumulative average.
@@ -391,19 +393,27 @@
   }
 
   // Cash-basis ledger: sales by 販売日, purchases by 仕入れ日, expenses by 支出日.
+  // Map of disposed set id -> 廃棄日. Items of these sets leave 仕入れ and are booked as 廃棄 on the disposal date.
+  function disposedDates(st) {
+    return new Map(st.sets.filter((s) => s.disposed_on).map((s) => [s.id, s.disposed_on]));
+  }
+
   function ledger(st, match) {
+    const disposed = disposedDates(st);
     const sales = st.sales.filter((s) => match(s.sold_on));
     const income = sum(sales.map((s) => s.sale_price));
     const sales_cost = sum(sales.map((s) => s.platform_fee + s.shipping_cost));
-    const purchase = sum(st.items.filter((i) => match(i.purchased_on)).map(itemCost))
+    const purchase = sum(st.items.filter((i) => !disposed.has(i.set_id) && match(i.purchased_on)).map(itemCost))
       + sum(st.supply_purchases.filter((p) => match(p.purchased_on)).map((p) => p.total));
     const expense = sum(st.expenses.filter((e) => match(e.spent_on)).map((e) => e.amount));
-    const profit = income - sales_cost - purchase - expense;
+    const waste = sum(st.items.filter((i) => disposed.has(i.set_id) && match(disposed.get(i.set_id))).map(itemCost));
+    const profit = income - sales_cost - purchase - expense - waste;
     return {
       income,
       sales_cost,
       purchase,
       expense,
+      waste,
       profit,
       count: sales.length,
       rate: rateOf(profit, income),
@@ -412,10 +422,11 @@
 
   function monthlyRows(st, year) {
     const inYear = (date) => year == null || date.startsWith(`${year}-`);
+    const disposed = disposedDates(st);
     const months = new Map();
     const month = (ym) => {
       if (!months.has(ym)) {
-        months.set(ym, { ym, income: 0, sales_cost: 0, purchase: 0, expense: 0, count: 0 });
+        months.set(ym, { ym, income: 0, sales_cost: 0, purchase: 0, expense: 0, waste: 0, count: 0 });
       }
       return months.get(ym);
     };
@@ -425,8 +436,11 @@
       m.sales_cost += s.platform_fee + s.shipping_cost;
       m.count += 1;
     });
-    st.items.filter((i) => inYear(i.purchased_on)).forEach((i) => {
+    st.items.filter((i) => !disposed.has(i.set_id) && inYear(i.purchased_on)).forEach((i) => {
       month(i.purchased_on.slice(0, 7)).purchase += itemCost(i);
+    });
+    st.items.filter((i) => disposed.has(i.set_id) && inYear(disposed.get(i.set_id))).forEach((i) => {
+      month(disposed.get(i.set_id).slice(0, 7)).waste += itemCost(i);
     });
     st.supply_purchases.filter((p) => inYear(p.purchased_on)).forEach((p) => {
       month(p.purchased_on.slice(0, 7)).purchase += p.total;
@@ -436,7 +450,7 @@
     });
     return [...months.values()]
       .map((m) => {
-        const profit = m.income - m.sales_cost - m.purchase - m.expense;
+        const profit = m.income - m.sales_cost - m.purchase - m.expense - m.waste;
         return { ...m, profit, rate: rateOf(profit, m.income) };
       })
       .sort((a, b) => (a.ym < b.ym ? 1 : -1));
@@ -448,9 +462,10 @@
       sales_cost: acc.sales_cost + r.sales_cost,
       purchase: acc.purchase + r.purchase,
       expense: acc.expense + r.expense,
+      waste: acc.waste + r.waste,
       profit: acc.profit + r.profit,
       count: acc.count + r.count,
-    }), { income: 0, sales_cost: 0, purchase: 0, expense: 0, profit: 0, count: 0 });
+    }), { income: 0, sales_cost: 0, purchase: 0, expense: 0, waste: 0, profit: 0, count: 0 });
     return { ...t, rate: rateOf(t.profit, t.income) };
   }
 
@@ -460,6 +475,7 @@
     st.items.forEach((i) => years.add(Number(i.purchased_on.slice(0, 4))));
     st.supply_purchases.forEach((p) => years.add(Number(p.purchased_on.slice(0, 4))));
     st.expenses.forEach((e) => years.add(Number(e.spent_on.slice(0, 4))));
+    st.sets.forEach((s) => { if (s.disposed_on) years.add(Number(s.disposed_on.slice(0, 4))); });
     return [...years].sort((a, b) => b - a);
   }
 
@@ -498,6 +514,7 @@
 
   function badgeClass(set) {
     if (set.sold) return 'sold';
+    if (set.disposed) return 'disposed';
     return set.status === '出品中' ? 'listed' : 'stock';
   }
 
@@ -515,7 +532,11 @@
       return { view: viewItemForm, id: arg };
     }
     if (head === 'purchases' && arg) return { view: viewPurchaseForm, id: arg };
-    if (head === 'stock') return { view: viewStock };
+    if (head === 'stock') {
+      if (arg === 'dispose') return { view: viewDisposeForm };
+      return { view: viewStock };
+    }
+    if (head === 'calendar') return { view: viewCalendar };
     if (head === 'supplies') return { view: viewSupplies };
     if (head === 'sets') {
       if (arg === undefined) return { view: viewSets };
@@ -657,17 +678,21 @@
       .slice(0, 5);
     const createdSets = d.setRows.slice(0, 5);
     const recentItems = d.itemRows.slice(0, 5);
+    const outSetIds = new Set(d.setRows.filter((s) => s.sold || s.disposed).map((s) => s.id));
+    const stockItems = d.itemRows.filter((i) => !outSetIds.has(i.set_id));
+    const setRate = stockItems.length ? stockItems.filter((i) => i.set_id != null).length / stockItems.length : null;
     return {
       title: 'ホーム',
       html: `
         <h1>${now.getFullYear()}年${now.getMonth() + 1}月のまとめ</h1>
         <div class="kpis">
           ${kpi('今月の売上', yen(month.income))}
-          ${kpi('今月の支出', yen(month.purchase + month.expense + month.sales_cost))}
+          ${kpi('今月の支出', yen(month.purchase + month.expense + month.sales_cost + month.waste))}
           ${kpi('今月の収支', yen(month.profit), signClass(month.profit))}
           ${kpi('今月の利益の総額', yen(monthProfit), signClass(monthProfit))}
           ${kpi(`1つ当たりの平均利益（${soldThisMonth.length}件）`, yen(perSet), signClass(perSet))}
-          ${kpi('在庫のセット', `${d.unsoldSets.length}件`)}
+          ${kpi('作成済みセット数', `${d.setRows.length}件`)}
+          ${kpi('セット作成率', `${pct(setRate)}<small class="muted">（総在庫 ${stockItems.length}点）</small>`)}
           ${kpi('在庫の原価', yen(d.stockCost))}
         </div>
         <div class="actions">
@@ -739,7 +764,10 @@
     return {
       title: '在庫',
       html: `
-        <h1>在庫</h1>
+        <div class="actions">
+          <h1>在庫</h1>
+          <a class="btn sub" href="#/stock/dispose">廃棄を登録</a>
+        </div>
         <div class="kpis">
           ${kpi('出品前のセット', `${planned}件`)}
           ${kpi('出品中のセット', `${listed}件`)}
@@ -1155,7 +1183,9 @@
         <td class="num">${yen(itemCost(i))}</td>
       </tr>`).join('') || '<tr><td colspan="7" class="muted">構成品がありません</td></tr>';
 
-    const listingHtml = set.sold
+    const listingHtml = set.disposed
+      ? `<div class="card">廃棄済み（${esc(set.disposed_on)}）のため出品・販売はできません。</div>`
+      : set.sold
       ? `<div class="card">出品先：${esc(set.list_channel) || '-'} ／ 出品価格：${yen(set.list_price)} ／ 出品日：${esc(set.listed_on) || '-'}</div>`
       : `
         <form class="card grid" data-form="listing" data-id="${set.id}">
@@ -1174,7 +1204,9 @@
           </div>
         </form>`;
 
-    const saleHtml = listed || set.sold
+    const saleHtml = set.disposed
+      ? '<p class="muted">廃棄済みのセットは販売できません。</p>'
+      : listed || set.sold
       ? `
         <form class="card grid" data-form="sale" data-id="${set.id}">
           <label>販売日
@@ -1212,10 +1244,13 @@
         <tr><td>販売手数料・発送料</td><td class="num">${Number(set.fees) ? '-' : ''}${yen(set.fees)}</td></tr>
         <tr><th>利益</th><th class="num ${signClass(set.profit)}">${yen(set.profit)}</th></tr>
         <tr><td>利益率</td><td class="num">${pct(rateOf(set.profit, set.revenue))}</td></tr>
-      </table>` : '<p class="muted">販売記録を入力すると利益が表示されます。</p>';
+      </table>` : set.disposed ? '<p class="muted">廃棄済みのセットは利益の対象外です。</p>' : '<p class="muted">販売記録を入力すると利益が表示されます。</p>';
 
     let deleteHtml = '';
-    if (set.sold) deleteHtml = '<p class="muted">販売済みのセットは削除できません。</p>';
+    if (set.disposed) {
+      deleteHtml = `<p class="muted">廃棄済みのセットは削除できません。</p>
+        <button class="btn sub" type="button" data-action="undispose-set" data-id="${set.id}" data-confirm="廃棄を取り消しますか？構成品は在庫に戻ります。">廃棄を取り消す</button>`;
+    } else if (set.sold) deleteHtml = '<p class="muted">販売済みのセットは削除できません。</p>';
     else if (listed) deleteHtml = '<p class="muted">出品中のセットは、出品を取り消すと削除できます。</p>';
     else deleteHtml = `<button class="btn danger" type="button" data-action="delete-set" data-id="${set.id}" data-confirm="このセットを削除しますか？構成品は未所属に戻ります。">このセットを削除</button>`;
 
@@ -1225,7 +1260,7 @@
         <div class="actions">
           <h1>${esc(set.name)}</h1>
           <span class="badge ${badgeClass(set)}">${esc(set.display_status)}</span>
-          ${set.sold ? '' : `<a class="btn sub small" href="#/sets/${set.id}/edit">構成品・名前を編集</a>`}
+          ${set.sold || set.disposed ? '' : `<a class="btn sub small" href="#/sets/${set.id}/edit">構成品・名前を編集</a>`}
         </div>
         ${set.description ? `<div class="card pre">${esc(set.description)}</div>` : ''}
         ${photoGrid(photos, urls, false)}
@@ -1277,7 +1312,7 @@
       title: '備品',
       html: `
         <h1>備品</h1>
-        <p class="muted">帯締め・帯揚げ・定価帯は数と総額で登録し、平均単価でセットの原価に入れます。梱包材は設定の単価を、セットごとに原価に入れます。</p>
+        <p class="muted">帯締め・帯揚げ・備品帯は数と総額で登録し、平均単価でセットの原価に入れます。梱包材は設定の単価を、セットごとに原価に入れます。</p>
         <div class="card table-wrap">
           <table>
             <tr><th>備品</th><th class="num">購入数</th><th class="num">使用数</th><th class="num">在庫数</th><th class="num">平均単価</th><th class="num">在庫の金額</th></tr>
@@ -1313,6 +1348,81 @@
           </table>
         </div>
         ${await receiptSection(st, 'supplies')}`,
+    };
+  }
+
+  function viewDisposeForm({ d }) {
+    const options = d.unsoldSets.map((s) => {
+      const cost = sum(s.members.map(itemCost));
+      return `<option value="${esc(s.id)}">${esc(s.name)}（仕入れ品の原価 ${yen(cost)}）</option>`;
+    }).join('');
+    return {
+      title: '廃棄を登録',
+      html: `
+        <h1>廃棄を登録</h1>
+        <p class="muted">廃棄したセットは在庫から外れ、構成品の本体と送料が廃棄として計上されます。仕入れの履歴は残ります。備品と梱包材は対象外です。</p>
+        ${d.unsoldSets.length ? `
+          <form class="card grid" data-form="dispose">
+            <label class="wide">廃棄するセット
+              <select name="set_id" required>${options}</select>
+            </label>
+            <label>廃棄日
+              <input type="date" name="disposed_on" value="${today()}">
+            </label>
+            <div class="wide actions">
+              <button class="btn danger" type="submit">廃棄を登録</button>
+              <a class="btn sub" href="#/stock">在庫へ戻る</a>
+            </div>
+          </form>` : '<p class="muted">廃棄できる在庫のセットはありません。</p>'}`,
+    };
+  }
+
+  function viewCalendar({ st, d, query }) {
+    const requested = query.get('month') || '';
+    const current = /^\d{4}-\d{2}$/.test(requested) ? requested : today().slice(0, 7);
+    const [year, month] = current.split('-').map(Number);
+    const shift = (delta) => {
+      const date = new Date(year, month - 1 + delta, 1);
+      return `${date.getFullYear()}-${pad2(date.getMonth() + 1)}`;
+    };
+    const boughtByDay = groupBy(st.items.filter((i) => i.purchased_on?.startsWith(`${current}-`)), (i) => i.purchased_on);
+    const listedByDay = groupBy(d.setRows.filter((s) => s.listed_on?.startsWith(`${current}-`)), (s) => s.listed_on);
+    const todayKey = today();
+    const days = new Date(year, month, 0).getDate();
+    const cells = [];
+    for (let k = 0; k < new Date(year, month - 1, 1).getDay(); k += 1) {
+      cells.push('<div class="cal-cell is-empty"></div>');
+    }
+    for (let day = 1; day <= days; day += 1) {
+      const key = `${current}-${pad2(day)}`;
+      const bought = (boughtByDay.get(key) || []).length;
+      const listed = (listedByDay.get(key) || []).length;
+      cells.push(`
+        <div class="cal-cell${key === todayKey ? ' is-today' : ''}">
+          <div class="cal-day">${day}</div>
+          ${bought ? `<div class="cal-buy">仕入れ ${bought}件</div>` : ''}
+          ${listed ? `<div class="cal-list">出品 ${listed}件</div>` : ''}
+        </div>`);
+    }
+    const monthBought = [...boughtByDay.values()].reduce((n, list) => n + list.length, 0);
+    const monthListed = [...listedByDay.values()].reduce((n, list) => n + list.length, 0);
+    return {
+      title: 'カレンダー',
+      html: `
+        <div class="actions">
+          <h1>カレンダー</h1>
+          <a class="btn sub small" href="#/calendar?month=${shift(-1)}">← 前月</a>
+          <strong>${year}年${month}月</strong>
+          <a class="btn sub small" href="#/calendar?month=${shift(1)}">翌月 →</a>
+          <a class="btn sub small" href="#/calendar">今月</a>
+        </div>
+        <p class="muted">仕入れは仕入れ日、出品は出品日で件数を数えています。${year}年${month}月：仕入れ ${monthBought}件 ／ 出品 ${monthListed}件</p>
+        <div class="card">
+          <div class="cal-grid">
+            ${['日', '月', '火', '水', '木', '金', '土'].map((w) => `<div class="cal-head">${w}</div>`).join('')}
+            ${cells.join('')}
+          </div>
+        </div>`,
     };
   }
 
@@ -1384,57 +1494,29 @@
     };
   }
 
-  const PIE_COLORS = { '利益': '#2e7d4f', '仕入れ': '#8c2f39', '経費': '#c9a227', '手数料・発送料': '#7a6e66' };
+  const PIE_PALETTE = ['#2e7d4f', '#8c2f39', '#c9a227', '#3c6e9f', '#7a6e66', '#9b5de5', '#e07a5f', '#2a9d8f'];
 
-  // Monthly profit as bars around a zero line. rows are newest first.
-  function profitBars(rows) {
-    const list = [...rows].reverse();
-    if (!list.length) return '<p class="muted">データがありません</p>';
-    const W = 640;
-    const H = 240;
-    const pad = 24;
-    const top = 14;
-    const bottom = 34;
-    const max = Math.max(1, ...list.map((m) => Math.abs(m.profit)));
-    const half = (H - top - bottom) / 2;
-    const y0 = top + half;
-    const slot = (W - pad * 2) / list.length;
-    const barW = Math.max(4, Math.min(36, slot * 0.6));
-    const bars = list.map((m, k) => {
-      const x = pad + slot * k + (slot - barW) / 2;
-      const h = (Math.abs(m.profit) / max) * half;
-      const y = m.profit >= 0 ? y0 - h : y0;
-      return `
-        <rect class="bar ${m.profit >= 0 ? 'plus' : 'minus'}" x="${x.toFixed(1)}" y="${y.toFixed(1)}" width="${barW.toFixed(1)}" height="${h.toFixed(1)}"><title>${esc(m.ym)} 収支 ${yen(m.profit)}</title></rect>
-        <text class="axis" x="${(x + barW / 2).toFixed(1)}" y="${H - 12}" text-anchor="middle">${esc(m.ym.slice(2).replace('-', '/'))}</text>`;
-    }).join('');
-    return `
-      <div class="chart">
-        <svg viewBox="0 0 ${W} ${H}" role="img" aria-label="月別の収支">
-          <line class="axis" x1="${pad}" x2="${W - pad}" y1="${y0}" y2="${y0}"></line>
-          ${bars}
-        </svg>
-      </div>`;
+  // [supplier, cost] pairs for items, largest first.
+  function supplierParts(items) {
+    return [...groupBy(items, (i) => i.supplier || '未設定')]
+      .map(([name, list]) => [name, sum(list.map(itemCost))])
+      .sort((a, b) => b[1] - a[1]);
   }
 
-  // Breakdown of sales: profit, purchases, expenses, fees and shipping. Negative profit is shown as 0.
-  function incomePie(period) {
-    const parts = [
-      ['利益', Math.max(0, period.profit)],
-      ['仕入れ', period.purchase],
-      ['経費', period.expense],
-      ['手数料・発送料', period.sales_cost],
-    ].filter(([, v]) => v > 0);
-    const total = sum(parts.map(([, v]) => v));
-    if (!total) return '<p class="muted">この期間の売上・支出データがありません</p>';
+  // [label, value] pairs as a pie chart. Values of 0 or less are left out.
+  function pieChart(parts) {
+    const shown = parts
+      .filter(([, v]) => v > 0)
+      .map(([label, v], k) => [label, v, PIE_PALETTE[k % PIE_PALETTE.length]]);
+    const total = sum(shown.map(([, v]) => v));
+    if (!total) return '<p class="muted">データがありません</p>';
     const cx = 100;
     const cy = 100;
     const r = 90;
     let angle = -Math.PI / 2;
-    const slices = parts.map(([label, v]) => {
+    const slices = shown.map(([label, v, color]) => {
       const frac = v / total;
-      const color = PIE_COLORS[label];
-      if (frac >= 1) return `<circle cx="${cx}" cy="${cy}" r="${r}" fill="${color}"><title>${label} ${yen(v)}</title></circle>`;
+      if (frac >= 1) return `<circle cx="${cx}" cy="${cy}" r="${r}" fill="${color}"><title>${esc(label)} ${yen(v)}</title></circle>`;
       const next = angle + frac * 2 * Math.PI;
       const x1 = cx + r * Math.cos(angle);
       const y1 = cy + r * Math.sin(angle);
@@ -1442,16 +1524,77 @@
       const y2 = cy + r * Math.sin(next);
       const large = frac > 0.5 ? 1 : 0;
       angle = next;
-      return `<path d="M${cx} ${cy} L${x1.toFixed(2)} ${y1.toFixed(2)} A${r} ${r} 0 ${large} 1 ${x2.toFixed(2)} ${y2.toFixed(2)} Z" fill="${color}"><title>${label} ${yen(v)}</title></path>`;
+      return `<path d="M${cx} ${cy} L${x1.toFixed(2)} ${y1.toFixed(2)} A${r} ${r} 0 ${large} 1 ${x2.toFixed(2)} ${y2.toFixed(2)} Z" fill="${color}"><title>${esc(label)} ${yen(v)}</title></path>`;
     }).join('');
-    const legend = parts.map(([label, v]) => `
-        <li><span class="swatch" style="background:${PIE_COLORS[label]}"></span>${label}　${yen(v)}（${pct(v / total)}）</li>`).join('');
+    const legend = shown.map(([label, v, color]) => `
+        <li><span class="swatch" style="background:${color}"></span>${esc(label)}　${yen(v)}（${pct(v / total)}）</li>`).join('');
     return `
       <div class="pie">
-        <svg class="pie-svg" viewBox="0 0 200 200" role="img" aria-label="売上の内訳">${slices}</svg>
+        <svg class="pie-svg" viewBox="0 0 200 200" role="img" aria-label="内訳">${slices}</svg>
         <ul class="legend">${legend}</ul>
+      </div>`;
+  }
+
+  // Monthly grouped bars. Yen series use the left axis and count series use the right axis. rows are newest first.
+  function trendChart(rows, series) {
+    const list = [...rows].reverse();
+    if (!list.length) return '<p class="muted">データがありません</p>';
+    const W = 640;
+    const H = 240;
+    const padL = 64;
+    const padR = 56;
+    const top = 14;
+    const bottom = 30;
+    const plotH = H - top - bottom;
+    const slot = (W - padL - padR) / list.length;
+    const range = {};
+    ['yen', 'count'].forEach((unit) => {
+      const values = series
+        .filter((s) => s.unit === unit)
+        .flatMap((s) => list.map((m) => s.value(m)))
+        .filter((v) => v != null);
+      if (values.length) range[unit] = { min: Math.min(0, ...values), max: Math.max(0, ...values) };
+    });
+    const yOf = (unit, v) => {
+      const { min, max } = range[unit];
+      return top + ((max - v) / ((max - min) || 1)) * plotH;
+    };
+    const xOf = (k) => padL + slot * (k + 0.5);
+    const groupW = slot * 0.8;
+    const barW = groupW / series.length;
+    const fmt = (unit, v) => (unit === 'yen' ? yen(v) : `${v}件`);
+    const bars = series.map((s, si) => list.map((m, k) => {
+      const v = s.value(m);
+      if (v == null) return '';
+      const x = xOf(k) - groupW / 2 + barW * si;
+      const y0 = yOf(s.unit, 0);
+      const y1 = yOf(s.unit, v);
+      return `<rect x="${x.toFixed(1)}" y="${Math.min(y0, y1).toFixed(1)}" width="${(barW - 1).toFixed(1)}" height="${Math.abs(y0 - y1).toFixed(1)}" fill="${s.color}"><title>${esc(m.ym)} ${esc(s.label)} ${fmt(s.unit, v)}</title></rect>`;
+    }).join('')).join('');
+    const zeroY = range.yen ? yOf('yen', 0).toFixed(1) : null;
+    const zero = zeroY == null ? '' : `<line class="axis" x1="${padL}" x2="${W - padR}" y1="${zeroY}" y2="${zeroY}"></line>`;
+    const scale = ['yen', 'count'].filter((unit) => range[unit]).map((unit) => {
+      const { min, max } = range[unit];
+      const x = unit === 'yen' ? padL - 6 : W - padR + 6;
+      const anchor = unit === 'yen' ? 'end' : 'start';
+      return `
+          <text class="axis" x="${x}" y="${top + 4}" text-anchor="${anchor}">${fmt(unit, max)}</text>
+          <text class="axis" x="${x}" y="${top + plotH}" text-anchor="${anchor}">${fmt(unit, min)}</text>`;
+    }).join('');
+    const months = list
+      .map((m, k) => `<text class="axis" x="${xOf(k).toFixed(1)}" y="${H - 8}" text-anchor="middle">${esc(m.ym.slice(2).replace('-', '/'))}</text>`)
+      .join('');
+    const legend = series.map((s) => `<li><span class="swatch" style="background:${s.color}"></span>${esc(s.label)}</li>`).join('');
+    return `
+      <div class="chart">
+        <svg viewBox="0 0 ${W} ${H}" role="img" aria-label="月別の推移">
+          ${zero}
+          ${scale}
+          ${bars}
+          ${months}
+        </svg>
       </div>
-      ${period.profit < 0 ? '<p class="muted">赤字の期間は利益を0円として表示しています。</p>' : ''}`;
+      <ul class="legend inline">${legend}</ul>`;
   }
 
   async function viewReport({ st, d, query }) {
@@ -1467,9 +1610,17 @@
       .filter((s) => s.sold && s.listed_on && s.sale.sold_on.startsWith(prefix))
       .map((s) => (Date.parse(s.sale.sold_on) - Date.parse(s.listed_on)) / 86400000);
     const avgDays = soldDays.length ? sum(soldDays) / soldDays.length : null;
-    const listedSetIds = new Set(d.setRows.filter((s) => s.display_status !== '出品前').map((s) => s.id));
-    const purchased = d.itemRows.filter((i) => i.purchased_on.startsWith(prefix));
-    const listRate = purchased.length ? purchased.filter((i) => listedSetIds.has(i.set_id)).length / purchased.length : null;
+    const soldInPeriod = d.setRows.filter((s) => s.sold && s.sale.sold_on.startsWith(prefix));
+    const perSaleProfit = soldInPeriod.length
+      ? Math.round(sum(soldInPeriod.map((s) => s.profit)) / soldInPeriod.length)
+      : null;
+    const soldByMonth = groupBy(d.setRows.filter((s) => s.sold), (s) => s.sale.sold_on.slice(0, 7));
+    const perSaleOf = (ym) => {
+      const list = soldByMonth.get(ym) || [];
+      return list.length ? sum(list.map((s) => s.profit)) / list.length : null;
+    };
+    const soldSupplierParts = supplierParts(soldInPeriod.flatMap((s) => s.members));
+    const stockSupplierParts = supplierParts([...d.unsoldSets.flatMap((s) => s.members), ...d.unassignedItems]);
     let label = '全期間';
     if (year !== null) label = month ? `${year}年${month}月` : `${year}年（年間）`;
     const rows = monthlyRows(st, year);
@@ -1496,22 +1647,23 @@
         <h2>${label}</h2>
         <div class="kpis">
           ${kpi('売上', yen(period.income))}
+          ${kpi('仕入れ', yen(period.purchase))}
+          ${kpi('手数料・発送料', yen(period.sales_cost))}
+          ${kpi('経費', yen(period.expense))}
+          ${kpi('廃棄', yen(period.waste))}
           ${kpi('利益', yen(period.profit), signClass(period.profit))}
           ${kpi('利益率', pct(period.rate), period.rate == null ? '' : signClass(period.rate))}
+          ${kpi('1件あたりの平均利益', perSaleProfit == null ? '-' : yen(perSaleProfit), perSaleProfit == null ? '' : signClass(perSaleProfit))}
           ${kpi('販売件数', `${period.count}件`)}
-          ${kpi('仕入れ', yen(period.purchase))}
-          ${kpi('経費', yen(period.expense))}
-          ${kpi('手数料・発送料', yen(period.sales_cost))}
           ${kpi('平均販売日数', avgDays == null ? '-' : `${avgDays.toFixed(1)}日`)}
-          ${kpi('出品率', pct(listRate))}
         </div>
         <h2>月別の内訳</h2>
-        <p class="muted">売上は販売日、仕入れは仕入れ日、経費は支出日で集計しています。利益率は利益÷売上です。平均販売日数は出品日から販売日までの平均、出品率は期間中に仕入れた品のうち出品済みの割合です。</p>
+        <p class="muted">売上は販売日、仕入れは仕入れ日、経費は支出日、廃棄は廃棄日で集計しています。廃棄した仕入れ品は仕入れに含めず、廃棄に計上しています。利益率は利益÷売上です。1件あたりの平均利益は販売済みセットの利益の合計÷販売件数です。平均販売日数は出品日から販売日までの平均です。</p>
         <div class="card table-wrap">
           <table>
             <tr>
               <th>年月</th><th class="num">売上</th><th class="num">手数料・発送料</th>
-              <th class="num">仕入れ</th><th class="num">経費</th><th class="num">収支</th><th class="num">利益率</th>
+              <th class="num">仕入れ</th><th class="num">経費</th><th class="num">廃棄</th><th class="num">収支</th><th class="num">利益率</th>
             </tr>
             ${rows.map((m) => `
               <tr>
@@ -1520,9 +1672,10 @@
                 <td class="num">${yen(m.sales_cost)}</td>
                 <td class="num">${yen(m.purchase)}</td>
                 <td class="num">${yen(m.expense)}</td>
+                <td class="num">${yen(m.waste)}</td>
                 <td class="num ${signClass(m.profit)}">${yen(m.profit)}</td>
                 <td class="num">${pct(m.rate)}</td>
-              </tr>`).join('') || '<tr><td colspan="7" class="muted">データがありません</td></tr>'}
+              </tr>`).join('') || '<tr><td colspan="8" class="muted">データがありません</td></tr>'}
             ${rows.length ? `
               <tr>
                 <th>合計</th>
@@ -1530,6 +1683,7 @@
                 <th class="num">${yen(total.sales_cost)}</th>
                 <th class="num">${yen(total.purchase)}</th>
                 <th class="num">${yen(total.expense)}</th>
+                <th class="num">${yen(total.waste)}</th>
                 <th class="num ${signClass(total.profit)}">${yen(total.profit)}</th>
                 <th class="num">${pct(total.rate)}</th>
               </tr>` : ''}
@@ -1538,12 +1692,28 @@
         <h2>ダッシュボード</h2>
         <div class="dash">
           <div class="card">
-            <h3>月別の利益推移</h3>
-            ${profitBars(rows)}
+            <h3>月別の推移（売上・仕入金額・手数料・利益）</h3>
+            ${trendChart(rows, [
+              { label: '売上', color: '#3c6e9f', unit: 'yen', value: (m) => m.income },
+              { label: '仕入金額', color: '#8c2f39', unit: 'yen', value: (m) => m.purchase },
+              { label: '手数料・発送料', color: '#7a6e66', unit: 'yen', value: (m) => m.sales_cost },
+              { label: '利益', color: '#2e7d4f', unit: 'yen', value: (m) => m.profit },
+            ])}
           </div>
           <div class="card">
-            <h3>${label}の売上の内訳</h3>
-            ${incomePie(period)}
+            <h3>月別の推移（1件あたりの平均利益・販売件数）</h3>
+            ${trendChart(rows, [
+              { label: '1件あたりの平均利益', color: '#c9a227', unit: 'yen', value: (m) => perSaleOf(m.ym) },
+              { label: '販売件数', color: '#3c6e9f', unit: 'count', value: (m) => m.count },
+            ])}
+          </div>
+          <div class="card">
+            <h3>${label}に売れたセットの仕入れ先</h3>
+            ${pieChart(soldSupplierParts)}
+          </div>
+          <div class="card">
+            <h3>在庫の仕入れ先（現在）</h3>
+            ${pieChart(stockSupplierParts)}
           </div>
         </div>
         ${receiptHtml}`,
@@ -1898,6 +2068,7 @@
     const existing = id == null ? null : st.sets.find((s) => s.id === id);
     if (id != null && !existing) throw new FormError('セットが見つかりません');
     if (existing && st.sales.some((s) => s.set_id === id)) throw new FormError('販売済みのセットは編集できません');
+    if (existing?.disposed_on) throw new FormError('廃棄済みのセットは編集できません');
     const order = fieldText(form, 'item_order').split(',').filter((x) => selected.has(x));
     const coverId = [...order, ...selected].find((x) => selected.has(x)) ?? null;
     const setId = existing?.id ?? newId();
@@ -1926,6 +2097,7 @@
     const st = await loadState();
     const set = st.sets.find((s) => s.id === setId);
     if (!set) throw new FormError('セットが見つかりません');
+    if (set.disposed_on) throw new FormError('廃棄済みのセットは出品できません');
     if (st.sales.some((s) => s.set_id === setId)) throw new FormError('販売記録があるため出品内容は変更できません');
     if (!st.items.some((i) => i.set_id === setId)) throw new FormError('構成品を選んでから出品してください');
     const listPrice = fieldInt(form, 'list_price');
@@ -1957,6 +2129,7 @@
     const st = await loadState();
     const set = st.sets.find((s) => s.id === setId);
     if (!set) throw new FormError('セットが見つかりません');
+    if (set.disposed_on) throw new FormError('廃棄済みのセットは販売できません');
     if (set.status !== '出品中') throw new FormError('出品中のセットだけ販売記録を入力できます');
     const existing = st.sales.find((s) => s.set_id === setId);
     const values = {
@@ -2094,6 +2267,7 @@
     const set = st.sets.find((s) => s.id === id);
     if (!set) return render();
     if (st.sales.some((s) => s.set_id === id)) throw new FormError('販売記録があるため削除できません');
+    if (set.disposed_on) throw new FormError('廃棄済みのセットは削除できません');
     if (set.status === '出品中') throw new FormError('出品中のセットは、出品を取り消してから削除してください');
     const photoIds = st.photos.filter((p) => p.set_id === id).map((p) => p.id);
     const released = st.items.filter((i) => i.set_id === id).map((i) => ({ ...i, set_id: null }));
@@ -2112,6 +2286,30 @@
   async function cancelSale(saleId) {
     await dbTx(['sales'], 'readwrite', (s) => { s.sales.delete(saleId); });
     notify('販売記録を取り消しました。セットは出品中に戻ります');
+    return render();
+  }
+
+  async function saveDisposal(form) {
+    const setId = fieldText(form, 'set_id');
+    const disposedOn = fieldDate(form, 'disposed_on');
+    const st = await loadState();
+    const set = st.sets.find((s) => s.id === setId);
+    if (!set) throw new FormError('廃棄するセットを選んでください');
+    if (set.disposed_on) throw new FormError('このセットは廃棄済みです');
+    if (st.sales.some((s) => s.set_id === setId)) throw new FormError('販売済みのセットは廃棄できません');
+    const cost = sum(st.items.filter((i) => i.set_id === setId).map(itemCost));
+    if (!confirm(`「${set.name}」を廃棄します。仕入れ品の原価 ${yen(cost)} を ${disposedOn} の廃棄として計上し、在庫から外します。よろしいですか？`)) return;
+    await dbTx(['sets'], 'readwrite', (s) => { s.sets.put({ ...set, disposed_on: disposedOn }); });
+    notify(`廃棄を登録しました（廃棄 ${yen(cost)}）`);
+    go('#/stock');
+  }
+
+  async function undisposeSet(id) {
+    const st = await loadState();
+    const set = st.sets.find((s) => s.id === id);
+    if (!set) return render();
+    await dbTx(['sets'], 'readwrite', (s) => { s.sets.put({ ...set, disposed_on: null }); });
+    notify('廃棄を取り消しました');
     return render();
   }
 
@@ -2211,9 +2409,9 @@
       [...st.expenses].sort(byDateThenSeq('spent_on')).map((e) => [e.id, e.spent_on, e.category, e.amount, e.memo]),
     ],
     monthly: (st) => [
-      ['年月', '売上', '手数料・発送料', '仕入れ', '経費', '収支', '利益率'],
+      ['年月', '売上', '手数料・発送料', '仕入れ', '経費', '廃棄', '収支', '利益率'],
       monthlyRows(st, null).reverse().map((m) => [
-        m.ym, m.income, m.sales_cost, m.purchase, m.expense, m.profit, pct(m.rate),
+        m.ym, m.income, m.sales_cost, m.purchase, m.expense, m.waste, m.profit, pct(m.rate),
       ]),
     ],
   };
@@ -2825,6 +3023,7 @@
     listing: saveListing,
     sale: saveSale,
     expense: saveExpense,
+    dispose: saveDisposal,
     supply: saveSupply,
     packaging: savePackaging,
     master: saveMaster,
@@ -2888,6 +3087,7 @@
       case 'delete-set': return deleteSet(data.id);
       case 'unlist': return unlistSet(data.id);
       case 'cancel-sale': return cancelSale(data.id);
+      case 'undispose-set': return undisposeSet(data.id);
       case 'delete-expense': return deleteExpense(data.id);
       case 'delete-supply': return deleteSupply(data.id);
       case 'delete-master': return deleteMaster(data.id);

@@ -376,3 +376,26 @@ button.tab { font: inherit; font-size: 0.9rem; cursor: pointer; }
 .legend { list-style: none; margin: 0; padding: 0; }
 .legend li { display: flex; align-items: center; gap: 8px; margin: 6px 0; }
 .swatch { display: inline-block; flex: 0 0 12px; width: 12px; height: 12px; border-radius: 3px; }
+.legend.inline { display: flex; flex-wrap: wrap; gap: 4px 16px; margin-top: 8px; }
+.legend.inline li { margin: 0; }
+
+.badge.disposed { background: #e6e6e6; color: #555; }
+
+.cal-grid { display: grid; grid-template-columns: repeat(7, minmax(0, 1fr)); gap: 4px; }
+.cal-head { text-align: center; font-size: 0.85rem; color: var(--muted); padding: 4px 0; }
+.cal-cell {
+  min-height: 72px;
+  padding: 6px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: #fff;
+  font-size: 0.8rem;
+}
+.cal-cell.is-empty { border: none; background: transparent; }
+.cal-cell.is-today { border-color: var(--accent); }
+.cal-day { font-weight: bold; margin-bottom: 4px; }
+.cal-buy { color: var(--accent); }
+.cal-list { color: #2a4d7a; }
+@media (max-width: 600px) {
+  .cal-cell { min-height: 56px; padding: 4px; }
+}
